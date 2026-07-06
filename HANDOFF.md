@@ -1,14 +1,32 @@
-# Termite — Conversation Handoff (v3)
+# Termite — Conversation Handoff (v4)
 
-This document gives the next conversation full context to continue development without losing anything. It supersedes v2. **Read this one, not v2 or conversation 1's — this one records M1 as actually, verifiably done.**
+This document gives the next conversation full context to continue development without losing anything. It supersedes v3. **Read this one — it records M1 (done, v3) and M2 (done, this session) as actually, verifiably done.**
 
 ---
 
-## M1 is done — verified, not just claimed
+## M2 is done — `termite-ssh` crate, verified with a real hermetic integration test
 
-Two prior handoffs (and one commit message, `aa8d928`) made claims about M1 status that didn't hold up. This time it was actually run: `cargo build --workspace` succeeded, `cargo run` opened a real window, a real `bash` shell spawned (its rc file ran — fastfetch output appeared, correctly parsed and rendered), and a human typed `echo hello` into the window and it echoed and executed correctly. Both the output path (PTY read → `vte::Parser` → `GridHandler` → `TerminalGrid` → text render) and the input path (keypress → VT bytes → PTY write) are confirmed working end-to-end, not just compiling.
+Scope for this session, confirmed with the user up front: **`termite-ssh` crate only**, no `termite-app` wiring. There's no host-management UI yet (that's M4) to drive a real connect from, so bridging into an Iced `Subscription` now would just be untested plumbing with no caller — better to build it when M4 gives it a real UI to attach to.
 
-**Trust `git show --stat <commit>` over commit messages when auditing this repo's history** — that habit is still warranted even though this handoff's own claims are verified.
+The `russh 0.62.2` API used below was verified by downloading and reading its actual source (client, server, and `keys::known_hosts` modules) before writing any code against it — not guessed from memory or docs.
+
+There's no `sshd` available in this environment (checked: not installed, not running), and installing a system SSH daemon is out of scope for verifying a library crate. So instead of a manual `cargo run` (how M1 was verified), this session wrote a **hermetic end-to-end integration test** (`crates/termite-ssh/tests/session.rs`) that spins up a real, minimal SSH server in-process via `russh::server` on an ephemeral loopback port (`127.0.0.1:0`, freshly generated ed25519 host key) and drives a full, real connection through it — not mocked:
+
+1. Connect → server presents its host key → classified `Unknown` → `SessionEvent::HostKeyUnknown` fires → test sends `SessionCommand::ApproveHostKey(true)`.
+2. `SessionEvent::AuthRequired(AuthChallenge::Password)` fires → test responds with `SessionCommand::AuthResponse(AuthResponse::Password(..))` → real password auth round-trip against the in-process server.
+3. `SessionEvent::Connected` fires → PTY + shell requested and confirmed (`ChannelMsg::Success` for both).
+4. Test sends `SessionCommand::Write(b"hello termite\n")` → server's `data` handler echoes it back over the real channel → `SessionEvent::Output` arrives with **byte-exact** matching content.
+5. `SessionCommand::Disconnect` → clean teardown, `SessionEvent::Disconnected { reason: Requested }`.
+6. **A second connection, same `known_hosts` file** → host key now classifies `Trusted` → goes straight to `AuthRequired` with no `HostKeyUnknown` prompt — proving the learn/persist round-trip actually works, not just that the code compiles.
+
+This actually ran and passed:
+```
+running 1 test
+test full_session_lifecycle_with_persisted_host_key ... ok
+```
+Plus 4 unit tests for `known_hosts.rs`'s classification logic (`Unknown`/`Trusted`/`Changed`/replace-then-`Trusted`), all passing. `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt -p termite-ssh` (then `--all --check`) are all clean for everything touched this session.
+
+**Not run this session:** `cargo audit` / `cargo deny check` — neither tool is installed in this environment (`which cargo-deny cargo-audit` → not found). `russh` pulls in a large crypto dependency tree (rsa, p256/p384/p521, aes-gcm, argon2, etc.) that hasn't been checked against `deny.toml`'s license allow-list or the vulnerability database. Worth running both before this ships, since CI gates on them.
 
 ---
 
@@ -27,11 +45,8 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 ## Repo state
 
 - **Location:** `~/Documents/code/termite`
-- **Git:** `main` branch, pushed and up to date with `origin/main` as of session start. This session added two commits on top of `be48398`:
-  - `bc0813a` — `feat(terminal): implement GridHandler and Pty for M1` (handler.rs, pty.rs, lib.rs wiring)
-  - `1dee84b` — `feat(app): wire local PTY terminal into termite-app for M1` (termite-app/src/lib.rs, Cargo.toml, Cargo.lock)
-- **Working tree:** clean as of end of session (verify with `git status` — don't assume, this repo's history has a track record of stale claims).
-- Not yet pushed to `origin` — the two new commits are local only. Push if/when asked.
+- **Git:** `main` branch. As of session start, `main` was clean and up to date with `origin/main` at `f490a1f`. **This session's changes are uncommitted** — working tree has modifications to `Cargo.toml`/`Cargo.lock`/`crates/termite-ssh/Cargo.toml`/`crates/termite-ssh/src/lib.rs` plus new files (`error.rs`, `events.rs`, `handler.rs`, `known_hosts.rs`, `session.rs`, `tests/session.rs`). Nothing was committed — commit only if/when asked, per this repo's working agreement.
+- Verify current state with `git status` / `git show --stat` rather than trusting this document or commit messages blindly — that habit from v3 still applies.
 
 ---
 
@@ -39,7 +54,7 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 
 ```
 termite/
-├── Cargo.toml                  # Workspace + binary package
+├── Cargo.toml                  # Workspace + binary package (+ russh, dirs added this session)
 ├── src/main.rs                 # Entry: calls termite_app::run()
 ├── ARCHITECTURE.md             # Full design doc — read this
 ├── CLAUDE.md                   # Command reference, security invariants, kept current
@@ -48,57 +63,55 @@ termite/
 ├── LICENSE (MIT)
 ├── README.md
 ├── .gitignore / .claudeignore
-├── deny.toml                   # cargo-deny: licence allow-list, openssl banned
+├── deny.toml                   # cargo-deny: licence allow-list, openssl banned (NOT re-verified against the new russh dep tree this session — see above)
 ├── .github/workflows/ci.yml    # lint + test (Linux/macOS/Win) + audit + deny
 └── crates/
     ├── termite-core/           # Shared types: SessionId, HostProfile, AuthMethod,
     │                           # ConnectionStatus, TermiteError. NO other workspace deps.
-    ├── termite-ssh/            # STUB — implemented in M2
-    ├── termite-terminal/       # DONE (M1) — see below
+    ├── termite-ssh/            # DONE (M2) — see below
+    ├── termite-terminal/       # DONE (M1)
     ├── termite-storage/        # STUB — implemented in M3
     ├── termite-crypto/         # STUB — implemented in M3
     ├── termite-ui/             # Theme + colour palette. TermiteTheme type.
-    └── termite-app/            # Iced 0.13 app. M1 terminal wired in (see below).
+    └── termite-app/            # Iced 0.13 app. M1 terminal wired in. NOT touched this session.
 ```
 
 ---
 
-## M1 (terminal emulator) — final state
+## M2 (SSH core) — final state
 
-### `crates/termite-terminal/`
-- **`cell.rs`** — `Cell { ch, fg, bg, attrs }`, `TermColor` (Default/Indexed(u8)/Rgb(u8,u8,u8)), `Attrs` (bold/dim/italic/underline/reverse/strikethrough).
-- **`grid.rs`** — `TerminalGrid`: primary + alt screen buffers, cursor state + save/restore, `put_char`/`linefeed`/`carriage_return`/`backspace`, scrollback (`VecDeque`, capped 10,000 lines), cursor movement, `erase_line`/`erase_display` with `EraseMode`, pending SGR state (`reset_sgr`/`set_fg`/`set_bg`/`set_attrs`), `resize`, `visible_rows() -> Vec<String>`, title.
-- **`handler.rs`** — `GridHandler<'a> { pub grid: &'a mut TerminalGrid }` implementing `vte::Perform`:
-  - `print`/`execute` (LF/CR/BS) → direct grid calls.
-  - `csi_dispatch` — cursor movement (A/B/C/D, with the VT convention that a `0`/absent param means move-by-1), `H`/`f` cursor position, `J`/`K` erase (via `EraseMode::from_param`), `m` SGR, and DEC private mode `?1049h`/`?1049l` (alt screen) gated on `intermediates == b"?"`.
-  - SGR parsing flattens `Params` (which groups colon-subparams into one slice per parameter, so semicolon-separated `38;2;r;g;b` arrives as four separate length-1 slices) into a single `Vec<u16>`, then walks it with a manual index so the `38`/`48` extended-colour forms (`;5;n` indexed, `;2;r;g;b` truecolour) can consume the right number of trailing elements.
-  - `esc_dispatch` — `ESC 7`/`8` save/restore cursor.
-  - `osc_dispatch` — `0`/`2` set title.
-- **`pty.rs`** — `Pty::spawn(shell, rows, cols) -> Result<Pty, PtyError>` via `portable-pty` 0.8.1's real API (verified against cached source, not guessed): `native_pty_system().openpty(PtySize)`, `pair.slave.spawn_command(cmd)`, explicit `drop(pair.slave)` after spawn (both `master`/`slave` fields on `PtyPair`, no `Copy`, so this is a partial-move-then-drop-remaining-field pattern) to avoid the child's fds staying held open in this process. `try_clone_reader`/`take_writer`/`resize` all take `&self` per the real trait (not `&mut self` as loosely assumed in v2's unverified sketch), so `Pty` exposes them as `&self` methods too. `PtyError` is a `thiserror` enum; `portable_pty`'s own error type is `anyhow::Error` (not part of its public API surface — `use anyhow::Error` internally, not `pub use`), so errors are converted with `.to_string()` at the boundary rather than named directly.
-- **`lib.rs`** — `pub mod cell/grid/handler/pty;` plus re-exports (`Cell`, `TermColor`, `Attrs`, `TerminalGrid`, `EraseMode`, `GridHandler`, `Pty`, `PtyError`).
+### `crates/termite-ssh/src/`
+- **`error.rs`** — `SshError` (`thiserror`): wraps `russh::Error` and `russh::keys::Error` via `#[from]`, plus `HostKeyRejected`, `AuthenticationFailed`, `UnsupportedAuthMethod`, `ChannelClosed`, `Io`. `impl From<SshError> for termite_core::TermiteError` maps to `TermiteError::Ssh(String)` at the crate boundary, per the convention already in `termite-core/src/error.rs`.
+- **`known_hosts.rs`** — wraps `russh::keys::known_hosts` (which already implements the real OpenSSH `known_hosts` format, including hashed hostnames — not reimplemented here). `known_hosts_path()` resolves `<platform config dir>/termite/known_hosts` via the new `dirs` crate. `HostKeyDecision` (`Trusted`/`Unknown`/`Changed { line }`) comes from classifying `check_known_hosts_path`'s `Ok(true)`/`Ok(false)`/`Err(KeyChanged{line})`. `record()` appends a new trusted entry (wraps `learn_known_hosts_path`); `replace()` handles the mismatch case by deleting the specific stale line then re-recording — only ever called after explicit user approval. **Quirk found and documented in a test comment:** `russh`'s `learn_known_hosts_path` writes a leading blank line when creating a brand-new file (its "does this file already end in a newline" check fails open on an empty file), so the first recorded entry ends up on line 2, not line 1 — don't assume line numbers, always use the value `classify()` actually returns.
+- **`events.rs`** — `SessionEvent` (`Connected`, `AuthRequired`, `Output`, `Disconnected`, `Error`, `HostKeyUnknown`, `HostKeyMismatch`), `SessionCommand` (`Write`, `Resize`, `AuthResponse`, `ApproveHostKey`, `Disconnect`), `AuthChallenge`/`AuthResponse` (password only — no `PublicKey`/`KeyboardInteractive` variants added speculatively; M3 adds those when `termite-crypto` exists to back them), `HostKey { algorithm, fingerprint }` (built from `ssh_key::PublicKey::fingerprint(HashAlg::Sha256)` — human-displayable, never raw key bytes), `DisconnectReason`.
+- **`handler.rs`** — `SessionHandler` implements `russh::client::Handler`. `type Error = SshError` directly (no wrapper needed — `SshError` already satisfies `From<russh::Error> + Send + Debug` via its `#[from]` variant). `check_server_key` is the security-critical bit: classifies against `known_hosts`, and for `Trusted` returns `Ok(true)` immediately; for `Unknown`/`Changed` it stashes a `oneshot::Sender<bool>` in a shared `Arc<Mutex<Option<..>>>`, fires the matching `SessionEvent`, and `.await`s the oneshot — resolved later by the session task when it sees `SessionCommand::ApproveHostKey`. If the event channel is dead or the oneshot is dropped, it returns `Ok(false)` — **never falls back to accepting**, satisfying the "no silent accept" invariant for real, not just in a doc comment.
+- **`session.rs`** — `SshSession::spawn(profile, known_hosts_path, event_tx) -> (SessionId, mpsc::Sender<SessionCommand>)`. Note `known_hosts_path` is a caller-supplied parameter, not resolved internally — this was a deliberate fix mid-session: an earlier draft resolved it internally via `known_hosts::known_hosts_path()`, which would have made every test (and any future caller) silently read/write the real developer's `~/.config/termite/known_hosts`. Spawns a `tokio::task` that: connects (concurrently polling `command_rx` for `ApproveHostKey` via `tokio::select!` against the pinned `connect()` future, since the handshake and the host-key approval have to happen concurrently); on `AuthMethod::Password` fires `AuthRequired` and waits for `AuthResponse`; `AuthMethod::PublicKey`/`Agent` fail immediately and explicitly with "not implemented until M3" rather than silently no-opping; opens a channel, requests PTY + shell and checks for `ChannelMsg::Success` on both (the default `russh::server::Handler::pty_request`/`shell_request` don't reply at all unless a server implementation calls `session.channel_success`, so a client that doesn't check for `Success`/`Failure` would hang forever against a broken/malicious server — checked for real via the test's server, which does reply correctly); then loops `tokio::select!` between `channel.wait()` (→ `Output`/disconnect) and `command_rx.recv()` (→ `Write`/`Resize`/`Disconnect`).
+- **`lib.rs`** — module wiring + re-exports (`SshError`, `SessionEvent`, `SessionCommand`, `AuthChallenge`, `AuthResponse`, `HostKey`, `DisconnectReason`, `HostKeyDecision`, `SshSession`).
 
-### `crates/termite-app/src/lib.rs`
-- `TermiteApp` (no longer the M0 unit struct): holds `grid: TerminalGrid`, `parser: vte::Parser`, `output: Arc<Mutex<Vec<u8>>>`, `writer: Box<dyn Write + Send>`, and `_pty: Pty` (kept alive; unused directly until session lifecycle work in M2+ needs it).
-- `TermiteApp::new()` spawns `$SHELL` (falls back to `/bin/bash`) at a fixed 30×100 grid, clones a PTY reader onto a `std::thread` that pushes bytes into the shared `output` buffer, and takes the writer for input.
-- Built via `iced::application(...).subscription(subscription).run_with(initialize)` — `run_with` (not `run`) because `TermiteApp` doesn't implement `Default` (it needs fallible PTY-spawn initialization).
-- `Message` is `PollOutput` and `KeyPressed { key: Key, modifiers: Modifiers }`.
-- Subscription batches `iced::time::every(16ms).map(|_| Message::PollOutput)` and `iced::keyboard::on_key_press(|key, modifiers| Some(Message::KeyPressed { key, modifiers }))` — confirmed `on_key_press` requires a plain `fn` pointer (non-capturing closures coerce fine, which is what's used).
-- `update` on `PollOutput` drains the shared buffer (`std::mem::take`) and feeds it through the grid/parser split-borrow pattern from v2's handoff (parser and grid taken as separate mutable field borrows so the parser can hold a `&mut GridHandler` borrowing grid without conflicting with `&mut self.parser`). On `KeyPressed`, maps the key to VT bytes and writes them to the PTY.
-- `view` renders `grid.visible_rows().join("\n")` as one `text(...)` widget with `Font::MONOSPACE`, size 14. No colour/attribute rendering yet — deferred to M6 as originally planned; the grid already tracks the data.
-- `key_to_bytes` covers Enter/Backspace/Tab/Escape/arrows/Space/plain characters, and `Ctrl+<alpha>` (mapped to the corresponding C0 control byte).
+### `crates/termite-ssh/tests/session.rs`
+The hermetic integration test described above. Implements a minimal in-process `russh::server::Handler` (`EchoServer`/`EchoHandler`) accepting a fixed test password, always accepting the session channel, replying `Success` to PTY/shell requests, and echoing `data` bytes back verbatim. Runs on `TcpListener::bind(("127.0.0.1", 0))` so it doesn't need a real port or root/admin privileges, and doesn't touch the real filesystem `known_hosts` (uses a `tempfile::tempdir()`).
 
-### Verified this session
-- `cargo check --workspace`, `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` — all clean, zero warnings.
-- `cargo fmt --all --check` — clean for every file touched this session. It reports diffs in two **pre-existing, untouched** files (`crates/termite-core/src/types.rs`, `crates/termite-ui/src/theme.rs`) that use manual column-aligned struct fields from earlier milestones — not introduced or fixed this session, left alone since fixing unrelated files wasn't requested. Worth a note to the user if `cargo fmt --all --check` is relied on as a CI gate — it currently fails on `main` because of those two files, independent of anything M1 touched.
-- Manual launch (`cargo run`, screenshotted while running): real window opened, real bash session started including shell rc execution, output rendered correctly as monospaced text, and a human-typed `echo hello` echoed and executed. Both PTY output and PTY input paths confirmed live, not just unit-tested.
+### Cargo changes
+- Workspace `Cargo.toml`: added `russh = "0.62"` and `dirs = "5"` to `[workspace.dependencies]`.
+- `crates/termite-ssh/Cargo.toml`: added `russh`, `tokio`, `tracing`, `dirs`, `secrecy`, `thiserror` (deps) and `tempfile`, `rand = "0.10"` (dev-deps, for the tests' generated keys and temp known_hosts files).
 
-### What M1 does NOT do (deferred, as originally scoped)
-- Mouse reporting (M6).
-- Coloured/attributed rendering in the Iced view — the grid tracks fg/bg/attrs per cell already, just not wired into `view()` yet.
-- Wide character support (CJK/emoji) — treated as width 1.
-- Scrollback UI, split panes (M6).
-- Dynamic grid resize on window resize — fixed 30×100 for now; `TerminalGrid::resize`/`Pty::resize` both exist and work, just nothing calls them yet.
-- Windows ConPTY testing (M4) — this session's manual verification was Linux/X11 only.
+### A real MSRV note
+`russh 0.62.2` itself declares `edition = "2024"` / `rust-version = "1.85"` — higher than this workspace's documented `rust-version = "1.78"`. The installed toolchain here is 1.90, and CI (`dtolnay/rust-toolchain@stable`) tracks stable rather than a pinned old version, so nothing actually breaks — but the workspace's `rust-version = "1.78"` field in `Cargo.toml` is now aspirational, not accurate, now that `termite-ssh` depends on `russh`. Not fixed this session (it's a one-line metadata change with no functional effect); worth bumping if anyone relies on that field for real.
+
+Also worth noting for M3: `russh` 0.62.2 pulls in `ssh-key 0.7.0-rc.11` transitively (via `russh::keys`), not the `ssh-key 0.6` version noted in `CLAUDE.md`'s dependency table as the intended pick for `termite-crypto`. When M3 adds its own direct `ssh-key` dependency, it should match `0.7.0-rc.11` (or whatever `russh` pulls in by then) to avoid two incompatible `PublicKey`/`PrivateKey` types existing in the dependency graph simultaneously.
+
+### What M2 does NOT do (deferred, as scoped)
+- Any `termite-app`/Iced wiring — no `SessionEvent`/`SessionCommand` flow into `AppMessage`, no `Subscription` bridge. Deliberately deferred until M4's host-management UI gives it a real caller.
+- Public-key or SSH-agent authentication — `AuthMethod::PublicKey`/`Agent` fail with an explicit "not implemented until M3" error. Needs `termite-crypto`'s `KeyProvider`.
+- Keyboard-interactive auth.
+- ProxyJump, port forwarding, SFTP (M7 per the roadmap).
+- `cargo audit` / `cargo deny check` against the new dependency tree (tools not installed here).
+
+---
+
+## M1 (terminal emulator) — unchanged this session, still done
+
+See v3 of this document (in git history, or just trust `crates/termite-terminal/` and `crates/termite-app/src/lib.rs` directly — both untouched this session). Summary: PTY spawn (`portable-pty`) + VT parsing (`vte::Parser` + `GridHandler`) + `TerminalGrid`, rendered as monospace text in Iced, with keyboard input mapped back to PTY writes. Verified end-to-end last session via manual `cargo run`.
 
 ---
 
@@ -107,16 +120,17 @@ termite/
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | UI framework | **Iced 0.13** | Pure Rust, GPU (wgpu), TEA architecture, MIT |
-| SSH library | **russh** | Pure Rust SSH-2, no FFI, MIT |
+| SSH library | **russh 0.62** | Pure Rust SSH-2, no FFI, MIT |
 | VT parsing | **vte 0.13** | Used by Alacritty, Apache-2.0 |
 | PTY | **portable-pty 0.8** | Cross-platform, MIT, from WezTerm |
 | Async runtime | **tokio 1** | Standard |
-| Key formats | **ssh-key 0.6** | RustCrypto, pure Rust |
-| Credential storage | **keyring 2** | OS keychain: macOS/Win/Linux |
+| Key formats | **ssh-key** (via `russh::keys`, currently `0.7.0-rc.11`) | RustCrypto, pure Rust — see MSRV/version note above |
+| Credential storage | **keyring 2** | OS keychain: macOS/Win/Linux (not yet added — M3) |
 | Secret memory | **secrecy 0.10 + zeroize 1** | Mandatory for all secret types |
 | Config format | **toml 0.8 + serde 1** | Human-editable |
 | Error handling | **thiserror 2** (libs) + **anyhow 1** (app) | Standard |
 | Logging | **tracing 0.1** | Structured, async-aware |
+| Platform dirs | **dirs 5** (new this session) | `known_hosts` path resolution |
 
 See ARCHITECTURE.md §4 for full crate justifications.
 
@@ -127,7 +141,7 @@ See ARCHITECTURE.md §4 for full crate justifications.
 ```
 termite-app
   ├── termite-ui      → termite-core, iced
-  ├── termite-ssh     → termite-core, termite-crypto
+  ├── termite-ssh     → termite-core, russh, tokio, dirs, secrecy
   ├── termite-terminal → termite-core
   ├── termite-storage → termite-core
   └── termite-crypto  → termite-core
@@ -140,13 +154,11 @@ This is enforced at the compiler level. Nothing leaks across layers.
 
 ## Security invariants (never break these)
 
-1. Secrets (`passwords`, `key material`) are ALWAYS wrapped in `secrecy::SecretString` or `secrecy::SecretVec<u8>` — never plain `String` or `Vec<u8>`.
+1. Secrets (`passwords`, `key material`) are ALWAYS wrapped in `secrecy::SecretString` or `secrecy::SecretVec<u8>` — never plain `String` or `Vec<u8>`. **Followed in M2**: `AuthResponse::Password` carries a `SecretString`; it's only exposed via `.expose_secret()` at the single point `russh::client::Handle::authenticate_password` needs an owned `String` (an unavoidable boundary crossing — `russh`'s own `auth::Method::Password` field is a plain, non-zeroizing `String` internally, which is a limitation of the upstream crate, not something termite-ssh can fix from outside).
 2. `zeroize` zeroes memory on drop. All secret types implement `ZeroizeOnDrop`.
-3. Host key verification is MANDATORY. Changed keys produce a prominent warning, never silent accept.
-4. Passwords and key passphrases are stored in the OS keychain (`keyring`), NEVER in config files on disk.
+3. Host key verification is MANDATORY. Changed keys produce a prominent warning, never silent accept. **Implemented and tested for real in M2** — see `handler.rs`'s `check_server_key` and the integration test's `HostKeyUnknown` step above.
+4. Passwords and key passphrases are stored in the OS keychain (`keyring`), NEVER in config files on disk. (Keyring integration itself is M3; M2's password flow is purely interactive/in-memory via `AuthResponse::Password`, never touches disk.)
 5. Secrets NEVER appear in `tracing` log output. `secrecy` enforces this via its `Debug` impl (`[REDACTED]`).
-
-(None of this is touched by M1 — no secrets flow through the terminal emulator.)
 
 ---
 
@@ -157,13 +169,7 @@ Conventional Commits format: `<type>(<scope>): <description>`
 Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `security`
 Scopes: `core`, `ssh`, `terminal`, `storage`, `crypto`, `ui`, `app`
 
-This session's commits followed this and can be used as a reference:
-```
-feat(terminal): implement GridHandler and Pty for M1
-feat(app): wire local PTY terminal into termite-app for M1
-```
-
-Git worked normally this session — plain `git add`/`git commit`, no lock-file workaround needed. The `git commit` sandbox workaround documented in older handoffs appears to be stale/environment-specific; no need to carry it forward unless it actually recurs.
+Nothing was committed this session (see "Repo state" above) — the working tree has M2's changes uncommitted. A reasonable commit split when asked to commit: one `feat(ssh)` commit for the crate implementation + `Cargo.toml` dependency additions, since the integration test and implementation are tightly coupled and were developed/verified together.
 
 ---
 
@@ -172,24 +178,24 @@ Git worked normally this session — plain `git add`/`git commit`, no lock-file 
 | Milestone | Status | Description |
 |-----------|--------|-------------|
 | **M0** | ✅ Done | Workspace scaffold, CI, window opens |
-| **M1** | ✅ Done | Local terminal emulator (PTY + VT emulation + Iced rendering) — verified end-to-end this session |
-| M2 | Pending | SSH core (password auth, known hosts) |
-| M3 | Pending | Key auth + credential storage |
-| M4 | Pending | Host management UI |
+| **M1** | ✅ Done | Local terminal emulator (PTY + VT emulation + Iced rendering) — verified end-to-end |
+| **M2** | ✅ Done | SSH core (password auth, mandatory known_hosts verification) — verified via hermetic in-process integration test this session |
+| M3 | Pending | Key auth + credential storage (`termite-crypto`'s `KeyProvider`, `keyring`) |
+| M4 | Pending | Host management UI — first real caller for `termite-ssh`'s `SessionEvent`/`SessionCommand` |
 | M5 | Pending | Tabs + multi-session |
 | M6 | Pending | Advanced terminal (colours, mouse, split, scrollback UI, dynamic resize) |
-| M7 | Pending | Port forwarding, SFTP |
+| M7 | Pending | Port forwarding, SFTP, ProxyJump |
 | M8 | Pending | Command palette, UX polish |
 | M9 | Pending | Security review, packaging, public release |
 
 ---
 
-## Suggested next steps (M2 — SSH core)
+## Suggested next steps (M3 — key auth + credential storage)
 
-Not started. `termite-ssh` is still a stub. Per ARCHITECTURE.md, M2 scope is password auth + known_hosts verification over `russh`, with the session communicating to `termite-app` via `tokio::sync::mpsc` (`SessionEvent` out, `SessionCommand` in), bridged into Iced via a `Subscription` — mirroring the pattern this session used for PTY output (background task/thread → shared state → polled or bridged into a message), but with `SessionEvent::HostKeyUnknown`/`HostKeyMismatch` handled explicitly per the security invariants above (no silent accept, ever). Read ARCHITECTURE.md §6-8 before starting.
+Per `ARCHITECTURE.md` and `CLAUDE.md`, M3 is `termite-crypto` (key loading/decryption/generation via `ssh-key` — pin to `0.7.0-rc.11` to match what `russh` already pulls in, see the version note above) plus `termite-storage`'s `CredentialStore` (OS keychain via `keyring`). Once `KeyProvider` exists, `termite-ssh/src/session.rs`'s `authenticate()` function has two clearly marked stubs (`AuthMethod::PublicKey`/`AuthMethod::Agent` currently return explicit "not implemented until M3" errors) that need real implementations — per `ARCHITECTURE.md` §8, the session should receive a `Box<dyn KeyProvider>` and call `.sign(data)`, never touching raw private key bytes directly (`russh::client::Handle::authenticate_publickey_with` takes a `Signer`, which is the natural fit — worth checking its exact signature against the real `russh` source the same way this session did for the client/server APIs, rather than assuming).
 
-Also worth doing opportunistically, not blocking M2: fix the two pre-existing `cargo fmt` violations in `termite-core/src/types.rs` and `termite-ui/src/theme.rs` (see "Verified this session" above) so `cargo fmt --all --check` actually passes on `main` again, since CI runs it.
+Also opportunistic, not blocking: run `cargo audit` and `cargo deny check` against the new dependency tree (neither was available in this session's environment) before this ships, and consider bumping the workspace's `rust-version` field to reflect what `russh` actually requires.
 
 ---
 
-*Handoff v3 written after completing and manually verifying M1, this conversation. Continue with M2 (SSH core) next.*
+*Handoff v4 written after implementing and verifying M2 (`termite-ssh` core) this conversation. Continue with M3 (key auth + credential storage) next.*

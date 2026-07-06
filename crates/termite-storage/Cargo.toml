@@ -10,4 +10,17 @@ termite-core = { workspace = true }
 serde        = { workspace = true }
 toml         = { workspace = true }
 thiserror    = { workspace = true }
-# keyring, secrecy added in M3 when credential storage is implemented
+secrecy      = { workspace = true }
+# keyring 4.x's `v1` compatibility shim has a live bug where its lazy
+# default-store initialization never actually runs (see HANDOFF.md) — every
+# `Entry::new` fails with "No default store has been set". keyring 3.x's
+# plain API doesn't have this rewrite's rough edges; `async-secret-service`
+# + `async-io` + `crypto-rust` keeps the Linux backend pure Rust (zbus, no
+# libdbus) and avoids `vendored`'s openssl pull-in (banned by deny.toml).
+keyring = { version = "3", default-features = false, features = [
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+    "apple-native",
+    "windows-native",
+] }
