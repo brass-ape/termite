@@ -1,0 +1,32 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bk
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.fleet/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.pdb
+*.exp
+*.lib
+
+# Coverage
+/lcov.info
+/coverage/
+
+# Fuzz
+fuzz/corpus/
+fuzz/artifacts/
+
+# Local env overrides
+.env
+.env.local
