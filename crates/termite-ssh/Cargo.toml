@@ -1,0 +1,10 @@
+[package]
+name        = "termite-ssh"
+description = "SSH protocol layer for Termite"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[dependencies]
+termite-core = { workspace = true }
+# russh, tokio, tracing added in M2 when the SSH layer is implemented

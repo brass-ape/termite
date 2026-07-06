@@ -1,0 +1,45 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[licenses]
+# Only allow permissive licences. No GPL/LGPL.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Zlib",
+]
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-3.0",
+    "LGPL-2.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+]
+copyleft = "deny"
+
+[advisories]
+# Deny crates with known security vulnerabilities.
+ignore = []
+
+[bans]
+# Warn on duplicate versions of the same crate; deny wildcard deps.
+multiple-versions = "warn"
+wildcards         = "deny"
+
+# Crates we explicitly do not want in the dependency tree.
+deny = [
+    # openssl: we use rustls/russh instead, which avoids C linkage
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "warn"

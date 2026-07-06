@@ -1,0 +1,17 @@
+[package]
+name        = "termite-app"
+description = "Top-level application state and entry point for Termite"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[dependencies]
+termite-core     = { workspace = true }
+termite-ui       = { workspace = true }
+termite-ssh      = { workspace = true }
+termite-terminal = { workspace = true }
+termite-storage  = { workspace = true }
+termite-crypto   = { workspace = true }
+iced             = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name        = "termite-terminal"
+description = "Terminal emulation for Termite"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[dependencies]
+termite-core = { workspace = true }
+# vte, portable-pty, tokio added in M1 when the terminal emulator is implemented

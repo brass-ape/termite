@@ -1,0 +1,74 @@
+[workspace]
+members = [
+    ".",
+    "crates/termite-core",
+    "crates/termite-ssh",
+    "crates/termite-terminal",
+    "crates/termite-storage",
+    "crates/termite-crypto",
+    "crates/termite-ui",
+    "crates/termite-app",
+]
+resolver = "2"
+
+# ── Shared package metadata ──────────────────────────────────────────────────
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+repository  = "https://github.com/YOUR_USERNAME/termite"
+rust-version = "1.78"
+
+# ── Approved dependency manifest ─────────────────────────────────────────────
+# Crates opt-in to individual deps; they don't all get everything.
+# Heavy deps (russh, vte, portable-pty, keyring, ssh-key) are added per-crate
+# when the relevant milestone is implemented.
+[workspace.dependencies]
+# Internal crates
+termite-core     = { path = "crates/termite-core" }
+termite-ssh      = { path = "crates/termite-ssh" }
+termite-terminal = { path = "crates/termite-terminal" }
+termite-storage  = { path = "crates/termite-storage" }
+termite-crypto   = { path = "crates/termite-crypto" }
+termite-ui       = { path = "crates/termite-ui" }
+termite-app      = { path = "crates/termite-app" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# UI framework (see ARCHITECTURE.md §2 for rationale)
+iced = { version = "0.13", features = ["tokio", "advanced"] }
+
+# Memory safety for secrets
+zeroize = { version = "1", features = ["derive"] }
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
+uuid  = { version = "1", features = ["v4"] }
+
+# Error handling
+thiserror = "2"
+anyhow    = "1"
+
+# Structured logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Binary package ────────────────────────────────────────────────────────────
+[package]
+name        = "termite"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+description = "A modern, open-source SSH client"
+
+[dependencies]
+termite-app = { workspace = true }
+iced        = { workspace = true }
+
+[profile.release]
+lto           = true
+codegen-units = 1
+strip         = true

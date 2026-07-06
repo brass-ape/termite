@@ -1,0 +1,13 @@
+[package]
+name        = "termite-core"
+description = "Shared types, traits, and errors for Termite"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[dependencies]
+thiserror = { workspace = true }
+zeroize   = { workspace = true }
+secrecy   = { workspace = true }
+serde     = { workspace = true }
+uuid      = { workspace = true }
