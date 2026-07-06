@@ -3356,6 +3356,7 @@ dependencies = [
  "termite-ui",
  "tracing",
  "tracing-subscriber",
+ "vte",
 ]
 
 [[package]]
