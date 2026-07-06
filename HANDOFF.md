@@ -199,3 +199,6 @@ Also opportunistic, not blocking: run `cargo audit` and `cargo deny check` again
 ---
 
 *Handoff v4 written after implementing and verifying M2 (`termite-ssh` core) this conversation. Continue with M3 (key auth + credential storage) next.*
+Dev note: currently, running the solution from the project root causes an infinite amount of terminal windows to open, probably worth addressing. The session ran out of usage tokens before the handoff could be updated. When the tokens ran out, the termite-ssh integration test for public key auth was in development, then it would have run full workspace verification and updated HANDOFF.md to v5, whatever that means.
+
+Please be more active with git commits, it would be appreciated.
