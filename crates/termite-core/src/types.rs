@@ -29,7 +29,6 @@ impl fmt::Display for SessionId {
 }
 
 // ── Host identity ─────────────────────────────────────────────────────────────
-
 /// Unique identifier for a saved host profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HostId(Uuid);

@@ -10,8 +10,8 @@ Please **do not** open a public GitHub issue for security vulnerabilities.
 
 Instead, report them privately:
 
-- **Email:** [your security contact here]
-- **Response time:** We aim to acknowledge reports within 72 hours.
+- **Email:** brass-ape@proton.me
+- **Response time:** We aim to acknowledge reports within 72 hours (Or from whenever I check my emails).
 - **Disclosure:** We follow a 90-day coordinated disclosure window.
 
 When reporting, please include:
