@@ -7,4 +7,7 @@ license.workspace    = true
 
 [dependencies]
 termite-core = { workspace = true }
-# vte, portable-pty, tokio added in M1 when the terminal emulator is implemented
+vte          = { workspace = true }
+portable-pty = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }

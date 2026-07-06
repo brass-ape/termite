@@ -36,6 +36,10 @@ termite-app      = { path = "crates/termite-app" }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Terminal emulation
+vte          = "0.13"
+portable-pty = "0.8"
+
 # UI framework (see ARCHITECTURE.md §2 for rationale)
 iced = { version = "0.13", features = ["tokio", "advanced"] }
 
