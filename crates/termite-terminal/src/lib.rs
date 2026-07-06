@@ -8,3 +8,13 @@
 //! - `vte` — VT sequence parser (Apache-2.0)
 //! - `portable-pty` — cross-platform PTY creation (MIT)
 //! - `tokio` — async I/O bridging
+
+pub mod cell;
+pub mod grid;
+pub mod handler;
+pub mod pty;
+
+pub use cell::{Attrs, Cell, TermColor};
+pub use grid::{EraseMode, TerminalGrid};
+pub use handler::GridHandler;
+pub use pty::{Pty, PtyError};
