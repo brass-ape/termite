@@ -1,0 +1,35 @@
+# Build artifacts and generated files — kept out of Claude's context as noise.
+# Best-effort convention only; not an enforced security boundary
+# (use permissions.deny in .claude/settings.json for that).
+
+# Rust build output
+/target
+**/*.rs.bk
+Cargo.lock.bk
+
+# Lockfile — large, machine-generated, rarely relevant to read
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.fleet/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.pdb
+*.exp
+*.lib
+
+# Coverage
+/lcov.info
+/coverage/
+
+# Fuzz
+fuzz/corpus/
+fuzz/artifacts/
