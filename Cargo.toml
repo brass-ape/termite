@@ -50,7 +50,7 @@ secrecy = { version = "0.10", features = ["serde"] }
 # Serialisation
 serde = { version = "1", features = ["derive"] }
 toml  = "0.8"
-uuid  = { version = "1", features = ["v4"] }
+uuid  = { version = "1", features = ["v4", "serde"] }
 
 # Error handling
 thiserror = "2"
