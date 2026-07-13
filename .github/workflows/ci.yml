@@ -55,12 +55,25 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y libxkbcommon-dev pkg-config
+          sudo apt-get install -y libxkbcommon-dev pkg-config gnome-keyring
 
       - name: Build
         run: cargo build --workspace
 
+      # The keyring integration tests exercise the real OS credential store.
+      # macOS (Keychain) and Windows (Credential Manager) provide one out of
+      # the box; headless Linux needs a session bus with an unlocked
+      # gnome-keyring providing org.freedesktop.secrets.
+      - name: Test (Linux, under D-Bus session with unlocked keyring)
+        if: runner.os == 'Linux'
+        run: |
+          dbus-run-session -- bash -c '
+            echo -n "ci" | gnome-keyring-daemon --unlock --components=secrets
+            cargo test --workspace
+          '
+
       - name: Test
+        if: runner.os != 'Linux'
         run: cargo test --workspace
 
   # ── Security audit ─────────────────────────────────────────────────────────
@@ -69,7 +82,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v1
+      # v2 ships a current cargo-audit that reads .cargo/audit.toml (v1's
+      # predates our advisory-ignore config and fails on it).
+      - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -79,4 +94,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      # v2 ships a current cargo-deny; deny.toml uses the 0.20 schema, which
+      # v1's bundled binary cannot parse.
+      - uses: EmbarkStudios/cargo-deny-action@v2
