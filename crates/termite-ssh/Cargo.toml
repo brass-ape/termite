@@ -20,3 +20,6 @@ thiserror      = { workspace = true }
 tempfile   = "3"
 rand       = { version = "0.10", features = ["thread_rng"] }
 env_logger = "0.11"
+# `net` provides UnixListenerStream, which russh's agent *server* (used to
+# run a hermetic in-process agent in tests) takes as its listener.
+tokio-stream = { version = "0.1", features = ["net"] }

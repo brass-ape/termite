@@ -297,6 +297,84 @@ async fn publickey_auth_with_unencrypted_key() {
     server_task.abort();
 }
 
+/// Runs a real, in-process SSH agent (russh's agent server) on a temp Unix
+/// socket, loads a key into it, points `$SSH_AUTH_SOCK` at it, and drives a
+/// full `AuthMethod::Agent` connection. The private key exists only inside
+/// the agent task — the session code never sees it.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_auth_signs_via_the_agent() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let agent_dir = tempfile::tempdir().unwrap();
+    let agent_path = agent_dir.path().join("agent.sock");
+    let listener = tokio::net::UnixListener::bind(&agent_path).unwrap();
+    let agent_task = tokio::spawn(russh::keys::agent::server::serve(
+        tokio_stream::wrappers::UnixListenerStream::new(listener),
+        // `()` implements `Agent` by confirming every request.
+        (),
+    ));
+
+    let client_key = termite_crypto::key::generate_ed25519().unwrap();
+    let allowed_key = client_key.public_key().clone();
+    {
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut agent = russh::keys::agent::client::AgentClient::connect(stream);
+        agent.add_identity(&client_key, &[]).await.unwrap();
+    }
+    drop(client_key);
+
+    // Process-global, but this is the only test that reads the variable, so
+    // there is nothing to race with (and it hermetically shadows any real
+    // agent on the developer's machine).
+    std::env::set_var("SSH_AUTH_SOCK", &agent_path);
+
+    let socket = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let config = Arc::new(server::Config {
+        keys: vec![host_key],
+        ..Default::default()
+    });
+    let server_task = tokio::spawn(async move {
+        let mut echo_server = EchoServer {
+            allowed_key: Some(allowed_key),
+        };
+        echo_server.run_on_socket(config, &socket).await
+    });
+
+    let known_hosts_dir = tempfile::tempdir().unwrap();
+    let known_hosts_path = known_hosts_dir.path().join("known_hosts");
+
+    let mut profile = HostProfile::new("test-server", "127.0.0.1", TEST_USER);
+    profile.port = port;
+    profile.auth = AuthMethod::Agent;
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let (_session_id, command_tx) = SshSession::spawn(profile, known_hosts_path, event_tx);
+
+    match recv_event(&mut event_rx).await {
+        SessionEvent::HostKeyUnknown(_) => {}
+        other => panic!("expected HostKeyUnknown, got {other:?}"),
+    }
+    command_tx
+        .send(SessionCommand::ApproveHostKey(true))
+        .await
+        .unwrap();
+
+    // Agent auth needs no credential prompts — straight to Connected.
+    match recv_event(&mut event_rx).await {
+        SessionEvent::Connected => {}
+        other => panic!("expected Connected, got {other:?}"),
+    }
+
+    command_tx.send(SessionCommand::Disconnect).await.unwrap();
+    let _ = recv_event(&mut event_rx).await;
+
+    server_task.abort();
+    agent_task.abort();
+}
+
 #[tokio::test]
 async fn publickey_auth_with_encrypted_key_prompts_for_passphrase() {
     let socket = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

@@ -171,9 +171,7 @@ async fn run(
     send_event(&event_tx, session_id, SessionEvent::Disconnected { reason }).await;
 }
 
-/// Authenticates using whichever method `profile.auth` specifies. Agent
-/// auth is deferred (see `HANDOFF.md`) and fails explicitly rather than
-/// silently no-opping.
+/// Authenticates using whichever method `profile.auth` specifies.
 async fn authenticate(
     session_id: SessionId,
     profile: &HostProfile,
@@ -189,8 +187,68 @@ async fn authenticate(
             authenticate_publickey(session_id, profile, key_path, handle, event_tx, command_rx)
                 .await
         }
-        AuthMethod::Agent => Err("agent authentication is deferred (see HANDOFF.md)".to_string()),
+        AuthMethod::Agent => authenticate_agent(profile, handle).await,
     }
+}
+
+/// RSA needs the hash the server negotiated via server-sig-algs; if the
+/// server never sent the extension, SHA-512 is the sensible modern default
+/// (plain SHA-1 ssh-rsa is dead). Non-RSA keys have exactly one signature
+/// scheme — no hash to pick.
+async fn negotiated_rsa_hash(
+    handle: &client::Handle<SessionHandler>,
+    public_key: &russh::keys::PublicKey,
+) -> Result<Option<russh::keys::HashAlg>, String> {
+    if matches!(public_key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
+        Ok(handle
+            .best_supported_rsa_hash()
+            .await
+            .map_err(|err| err.to_string())?
+            .unwrap_or(Some(russh::keys::HashAlg::Sha512)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Tries every identity the user's SSH agent holds until one succeeds.
+/// Signing happens inside the agent process, so private key material never
+/// enters Termite at all (see `ARCHITECTURE.md` §"SSH agent integration").
+/// Certificate identities are offered as their bare public key for now —
+/// a server that only accepts the certificate rejects it and the next
+/// identity is tried.
+async fn authenticate_agent(
+    profile: &HostProfile,
+    handle: &mut client::Handle<SessionHandler>,
+) -> Result<(), String> {
+    let mut agent = crate::agent::connect().await?;
+    let identities = agent
+        .request_identities()
+        .await
+        .map_err(|err| format!("cannot list SSH agent identities: {err}"))?;
+
+    if identities.is_empty() {
+        return Err("the SSH agent is running but holds no identities".to_string());
+    }
+
+    let tried = identities.len();
+    for identity in identities {
+        let public_key = identity.public_key().into_owned();
+        let hash_alg = negotiated_rsa_hash(handle, &public_key).await?;
+
+        let result = handle
+            .authenticate_publickey_with(profile.username.clone(), public_key, hash_alg, &mut agent)
+            .await
+            .map_err(|err| err.to_string())?;
+        if result.success() {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "agent authentication failed for user {}: the server accepted none of \
+         the agent's {tried} identities",
+        profile.username
+    ))
 }
 
 async fn authenticate_password(
@@ -288,20 +346,7 @@ async fn authenticate_publickey(
     };
 
     let public_key = key.public_key().clone();
-
-    // RSA needs the hash the server negotiated via server-sig-algs; if the
-    // server never sent the extension, SHA-512 is the sensible modern
-    // default (plain SHA-1 ssh-rsa is dead). Non-RSA keys have exactly one
-    // signature scheme — no hash to pick.
-    let hash_alg = if matches!(public_key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
-        handle
-            .best_supported_rsa_hash()
-            .await
-            .map_err(|err| err.to_string())?
-            .unwrap_or(Some(russh::keys::HashAlg::Sha512))
-    } else {
-        None
-    };
+    let hash_alg = negotiated_rsa_hash(handle, &public_key).await?;
 
     let provider = termite_crypto::LocalKeyProvider::new(key);
     let mut signer = KeyProviderSigner::new(Box::new(provider));
