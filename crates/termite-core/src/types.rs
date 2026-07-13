@@ -56,13 +56,13 @@ impl fmt::Display for HostId {
 /// A saved SSH connection profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProfile {
-    pub id:       HostId,
-    pub name:     String,
-    pub host:     String,
-    pub port:     u16,
+    pub id: HostId,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
     pub username: String,
-    pub auth:     AuthMethod,
-    pub tags:     Vec<String>,
+    pub auth: AuthMethod,
+    pub tags: Vec<String>,
 }
 
 impl HostProfile {
@@ -73,13 +73,13 @@ impl HostProfile {
         username: impl Into<String>,
     ) -> Self {
         Self {
-            id:       HostId::new(),
-            name:     name.into(),
-            host:     host.into(),
-            port:     22,
+            id: HostId::new(),
+            name: name.into(),
+            host: host.into(),
+            port: 22,
             username: username.into(),
-            auth:     AuthMethod::Agent,
-            tags:     Vec::new(),
+            auth: AuthMethod::Agent,
+            tags: Vec::new(),
         }
     }
 }
@@ -118,11 +118,11 @@ pub enum ConnectionStatus {
 impl fmt::Display for ConnectionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connecting            => write!(f, "Connecting"),
-            Self::Connected             => write!(f, "Connected"),
+            Self::Connecting => write!(f, "Connecting"),
+            Self::Connected => write!(f, "Connected"),
             Self::Reconnecting { attempt } => write!(f, "Reconnecting (attempt {attempt})"),
-            Self::Disconnected          => write!(f, "Disconnected"),
-            Self::Failed { reason }     => write!(f, "Failed: {reason}"),
+            Self::Disconnected => write!(f, "Disconnected"),
+            Self::Failed { reason } => write!(f, "Failed: {reason}"),
         }
     }
 }

@@ -169,7 +169,10 @@ mod tests {
         let store = MemoryStore::new();
         let password = SecretString::from("hunter2".to_string());
 
-        assert!(store.get_password("example.com", "alice").unwrap().is_none());
+        assert!(store
+            .get_password("example.com", "alice")
+            .unwrap()
+            .is_none());
 
         store
             .set_password("example.com", "alice", &password)
@@ -178,7 +181,10 @@ mod tests {
         assert_eq!(retrieved.expose_secret(), "hunter2");
 
         store.delete_password("example.com", "alice").unwrap();
-        assert!(store.get_password("example.com", "alice").unwrap().is_none());
+        assert!(store
+            .get_password("example.com", "alice")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

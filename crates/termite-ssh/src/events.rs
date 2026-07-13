@@ -45,7 +45,9 @@ pub enum AuthChallenge {
     Password,
     /// The key at the configured path is encrypted; `fingerprint` identifies
     /// it for display (never the key material itself).
-    Passphrase { fingerprint: String },
+    Passphrase {
+        fingerprint: String,
+    },
 }
 
 /// The app's answer to an [`AuthChallenge`].
