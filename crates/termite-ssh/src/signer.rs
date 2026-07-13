@@ -29,8 +29,23 @@ impl Signer for KeyProviderSigner {
         _hash_alg: Option<HashAlg>,
         to_sign: Vec<u8>,
     ) -> Result<Vec<u8>, Self::Error> {
-        self.provider
+        // russh's `Signer` contract (per `AgentClient::sign_request`, the
+        // reference implementation): return the *entire* `to_sign` buffer
+        // with the signature appended as an SSH string —
+        // `u32-length ++ string(algorithm) ++ string(signature-bytes)` —
+        // not the bare signature. russh then slices the userauth packet
+        // out of the returned buffer; returning only signature bytes makes
+        // it emit a malformed packet and hang waiting for an auth reply.
+        let sig_blob = self
+            .provider
             .sign(&to_sign)
-            .map_err(|err| SshError::KeyProvider(err.to_string()))
+            .map_err(|err| SshError::KeyProvider(err.to_string()))?;
+        let sig_len = u32::try_from(sig_blob.len())
+            .map_err(|_| SshError::KeyProvider("signature blob exceeds u32 length".to_string()))?;
+
+        let mut signed = to_sign;
+        signed.extend_from_slice(&sig_len.to_be_bytes());
+        signed.extend_from_slice(&sig_blob);
+        Ok(signed)
     }
 }
