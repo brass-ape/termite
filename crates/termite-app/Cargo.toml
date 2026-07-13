@@ -4,6 +4,7 @@ description = "Top-level application state and entry point for Termite"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
+publish.workspace    = true
 
 [dependencies]
 termite-core     = { workspace = true }

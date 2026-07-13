@@ -17,7 +17,10 @@ version     = "0.1.0"
 edition     = "2021"
 license     = "MIT"
 repository  = "https://github.com/YOUR_USERNAME/termite"
-rust-version = "1.78"
+# russh 0.62 requires 1.85; this tracks the real MSRV of the dependency tree.
+rust-version = "1.85"
+# These crates are internal to the Termite application — not for crates.io.
+publish     = false
 
 # ── Approved dependency manifest ─────────────────────────────────────────────
 # Crates opt-in to individual deps; they don't all get everything.
@@ -70,6 +73,7 @@ name        = "termite"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
+publish.workspace    = true
 description = "A modern, open-source SSH client"
 
 [dependencies]

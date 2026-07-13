@@ -2,7 +2,9 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [licenses]
-# Only allow permissive licences. No GPL/LGPL.
+# Only allow permissive licences. Anything not on this list — including all
+# GPL/LGPL/AGPL variants — is rejected (cargo-deny removed the separate
+# `deny`/`copyleft` keys; the allow-list *is* the policy now).
 allow = [
     "MIT",
     "Apache-2.0",
@@ -10,28 +12,43 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
+    "Unicode-3.0",
     "CC0-1.0",
     "Zlib",
+    # Boost Software License — permissive (clipboard-win, error-code).
+    "BSL-1.0",
+    # File-level weak copyleft; fine when the crate is used unmodified, and
+    # notably not GPL/LGPL (option-ext, via `dirs`).
+    "MPL-2.0",
 ]
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-    "LGPL-2.0",
-    "LGPL-2.1",
-    "LGPL-3.0",
-]
-copyleft = "deny"
 
 [advisories]
+# `unmaintained` advisories only fail for *direct* workspace dependencies.
+# The transitive GUI stack (ttf-parser, rustybuzz, instant, paste, …) is
+# pinned by iced/winit and not actionable from here.
+unmaintained = "workspace"
 # Deny crates with known security vulnerabilities.
-ignore = []
+ignore = [
+    # rsa: Marvin Attack timing sidechannel (no patched release exists).
+    # Pulled in transitively by russh/ssh-key; Termite itself only generates
+    # and signs with ed25519 keys today. Revisit whenever RustCrypto ships a
+    # fixed `rsa` release or russh drops the dependency.
+    { id = "RUSTSEC-2023-0071", reason = "no fix released; RSA is not used by termite's own key handling" },
+    # quick-xml DoS advisories: quick-xml is only reachable via
+    # wayland-scanner, a build-time proc-macro that parses trusted, vendored
+    # Wayland protocol XML. Not attacker-reachable at runtime. Pinned by the
+    # winit/smithay stack, so we cannot bump it independently.
+    { id = "RUSTSEC-2026-0194", reason = "build-time proc-macro dep parsing trusted protocol XML" },
+    { id = "RUSTSEC-2026-0195", reason = "build-time proc-macro dep parsing trusted protocol XML" },
+]
 
 [bans]
 # Warn on duplicate versions of the same crate; deny wildcard deps.
+# Version-less `path` dependencies between workspace crates are allowed —
+# they aren't real wildcards.
 multiple-versions = "warn"
-wildcards         = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
 
 # Crates we explicitly do not want in the dependency tree.
 deny = [

@@ -1,0 +1,14 @@
+# cargo-audit configuration — keep in sync with deny.toml's [advisories].
+
+[advisories]
+ignore = [
+    # rsa: Marvin Attack timing sidechannel. No patched release exists; pulled
+    # in transitively by russh/ssh-key. Termite's own key handling is
+    # ed25519-only today. Revisit when RustCrypto ships a fixed `rsa`.
+    "RUSTSEC-2023-0071",
+    # quick-xml DoS advisories: only reachable via wayland-scanner, a
+    # build-time proc-macro parsing trusted, vendored Wayland protocol XML.
+    # Pinned by the winit/smithay stack; not attacker-reachable at runtime.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
