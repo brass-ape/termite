@@ -288,11 +288,26 @@ async fn authenticate_publickey(
     };
 
     let public_key = key.public_key().clone();
+
+    // RSA needs the hash the server negotiated via server-sig-algs; if the
+    // server never sent the extension, SHA-512 is the sensible modern
+    // default (plain SHA-1 ssh-rsa is dead). Non-RSA keys have exactly one
+    // signature scheme — no hash to pick.
+    let hash_alg = if matches!(public_key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
+        handle
+            .best_supported_rsa_hash()
+            .await
+            .map_err(|err| err.to_string())?
+            .unwrap_or(Some(russh::keys::HashAlg::Sha512))
+    } else {
+        None
+    };
+
     let provider = termite_crypto::LocalKeyProvider::new(key);
     let mut signer = KeyProviderSigner::new(Box::new(provider));
 
     let result = handle
-        .authenticate_publickey_with(profile.username.clone(), public_key, None, &mut signer)
+        .authenticate_publickey_with(profile.username.clone(), public_key, hash_alg, &mut signer)
         .await
         .map_err(|err| err.to_string())?;
 

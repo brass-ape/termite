@@ -4,8 +4,24 @@ use secrecy::SecretString;
 
 use crate::error::TermiteError;
 
+/// Hash algorithm for RSA signatures (`rsa-sha2-256` / `rsa-sha2-512`).
+///
+/// SSH servers advertise which RSA signature algorithms they accept via the
+/// `server-sig-algs` extension, and the signature blob's algorithm name must
+/// match what was negotiated — so the SSH layer has to be able to tell a
+/// [`KeyProvider`] which hash to sign with. Irrelevant for non-RSA keys
+/// (ed25519/ECDSA have exactly one signature scheme each). Deliberately our
+/// own type: `termite-core` depends on no SSH crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaHashAlg {
+    /// `rsa-sha2-256`.
+    Sha256,
+    /// `rsa-sha2-512`.
+    Sha512,
+}
+
 /// Signs data on behalf of an SSH identity without exposing the private key
-/// material to the caller — `termite-ssh` calls `.sign(data)` and never
+/// material to the caller — `termite-ssh` calls `.sign(data, hash)` and never
 /// touches raw key bytes directly (see `CLAUDE.md`'s architecture patterns).
 ///
 /// Implemented by `termite-crypto` for keys loaded from disk. A future
@@ -17,7 +33,11 @@ pub trait KeyProvider: Send + Sync {
 
     /// Signs `data`, returning an SSH wire-format signature blob
     /// (algorithm name + signature data).
-    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, TermiteError>;
+    ///
+    /// `hash` selects the RSA signature algorithm when the underlying key is
+    /// RSA (`None` lets the implementation pick its default, SHA-512);
+    /// implementations must ignore it for non-RSA keys.
+    fn sign(&self, data: &[u8], hash: Option<RsaHashAlg>) -> Result<Vec<u8>, TermiteError>;
 }
 
 /// Stores and retrieves secrets (host passwords, key passphrases) in the

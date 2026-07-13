@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 
 use ssh_key::encoding::Encode;
-use ssh_key::PrivateKey;
+use ssh_key::private::KeypairData;
+use ssh_key::{HashAlg, PrivateKey};
 
-use termite_core::{KeyProvider, TermiteError};
+use termite_core::{KeyProvider, RsaHashAlg, TermiteError};
 
 /// A [`KeyProvider`] backed by an in-memory, already-decrypted private key.
 /// The key material never leaves this type — callers only ever get back
@@ -25,13 +26,24 @@ impl KeyProvider for LocalKeyProvider {
             .expect("encoding a public key blob is infallible for in-memory keys")
     }
 
-    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, TermiteError> {
+    fn sign(&self, data: &[u8], hash: Option<RsaHashAlg>) -> Result<Vec<u8>, TermiteError> {
         use signature::Signer;
 
-        let signature = self
-            .0
-            .try_sign(data)
-            .map_err(|err| crate::error::CryptoError::Key(err.into()))?;
+        // For RSA the signature algorithm name must match what the server
+        // negotiated (rsa-sha2-256/512), so honor the requested hash;
+        // ssh-key's plain `try_sign` would always pick SHA-512. All other
+        // key types have a single signature scheme and ignore `hash`.
+        let signature = match (self.0.key_data(), hash) {
+            (KeypairData::Rsa(keypair), Some(hash)) => {
+                let hash = match hash {
+                    RsaHashAlg::Sha256 => HashAlg::Sha256,
+                    RsaHashAlg::Sha512 => HashAlg::Sha512,
+                };
+                (keypair, Some(hash)).try_sign(data)
+            }
+            _ => self.0.try_sign(data),
+        }
+        .map_err(|err| crate::error::CryptoError::Key(err.into()))?;
         let bytes = signature
             .encode_vec()
             .map_err(crate::error::CryptoError::Encoding)?;
@@ -56,7 +68,7 @@ mod tests {
         let provider = LocalKeyProvider::new(key);
 
         let data = b"ssh auth session data to sign";
-        let sig_bytes = provider.sign(data).unwrap();
+        let sig_bytes = provider.sign(data, None).unwrap();
         let signature = Signature::decode(&mut &sig_bytes[..]).unwrap();
 
         // `PublicKey` also has an inherent `verify(namespace, msg, &SshSig)`
@@ -74,7 +86,7 @@ mod tests {
         let public_key = key.public_key().clone();
         let provider = LocalKeyProvider::new(key);
 
-        let sig_bytes = provider.sign(b"original data").unwrap();
+        let sig_bytes = provider.sign(b"original data", None).unwrap();
         let signature = Signature::decode(&mut &sig_bytes[..]).unwrap();
 
         assert!(Verifier::verify(&public_key, b"different data", &signature).is_err());
