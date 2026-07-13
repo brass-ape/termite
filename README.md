@@ -37,7 +37,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and [the roadmap](#ro
 
 ## Building
 
-Requirements: Rust 1.78+ (stable)
+Requirements: Rust 1.85+ (stable)
 
 ```sh
 git clone https://github.com/YOUR_USERNAME/termite

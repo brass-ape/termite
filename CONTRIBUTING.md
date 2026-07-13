@@ -11,7 +11,7 @@ Thank you for your interest in contributing. This document covers the developmen
 ## Development Setup
 
 Requirements:
-- Rust 1.78+ (stable channel)
+- Rust 1.85+ (stable channel)
 - `cargo-audit` — `cargo install cargo-audit`
 - `cargo-deny` — `cargo install cargo-deny`
 

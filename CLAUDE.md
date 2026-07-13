@@ -26,7 +26,7 @@ cargo deny check                     # license allow-list + banned deps (see den
 
 Linux needs `libxkbcommon-dev` and `pkg-config` system packages for Iced (see `.github/workflows/ci.yml`). CI runs lint (fmt + clippy), test (Linux/macOS/Windows matrix), `cargo audit`, and `cargo deny` on every push/PR to `main`.
 
-Requires Rust 1.78+ stable.
+Requires Rust 1.85+ stable (russh 0.62's MSRV).
 
 ## Workspace layout
 
