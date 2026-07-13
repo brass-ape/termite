@@ -20,6 +20,7 @@ mod handler;
 pub mod known_hosts;
 mod session;
 mod signer;
+pub mod ssh_config;
 
 pub use error::SshError;
 pub use events::{
@@ -27,3 +28,4 @@ pub use events::{
 };
 pub use known_hosts::HostKeyDecision;
 pub use session::SshSession;
+pub use ssh_config::{HostConfig, SshConfig};

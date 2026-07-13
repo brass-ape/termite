@@ -39,6 +39,16 @@ pub enum SshError {
     /// failed.
     #[error("key provider error: {0}")]
     KeyProvider(String),
+
+    /// A malformed line in an `ssh_config` file. Parsing refuses rather
+    /// than silently misreading auth-relevant configuration.
+    #[error("ssh_config parse error at line {line}: {message}")]
+    ConfigParse {
+        /// 1-based line number of the malformed directive.
+        line: usize,
+        /// What was wrong with it.
+        message: String,
+    },
 }
 
 impl From<SshError> for termite_core::TermiteError {
