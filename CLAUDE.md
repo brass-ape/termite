@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Termite — a native, open-source SSH client written entirely in Rust (Linux/macOS/Windows). No accounts, telemetry, subscriptions, or AI features; local-first. Full design rationale, rejected alternatives, and the milestone-by-milestone plan live in `ARCHITECTURE.md` — read it before making any architectural decision, not just this file.
 
-**Read `HANDOFF.md` at the start of a session.** This project uses it as a running log of exact per-milestone progress (what compiles, what's stubbed, what's left) that is more current than the roadmap table below. Commit messages in this repo are not reliable narration of what a commit actually contains (verify with `git show --stat` rather than trusting the message) — trust `HANDOFF.md` and the code itself over git history.
+**Read `HANDOFF.md` at the start of a session.** This project uses it as a running log of exact per-milestone progress (what compiles, what's stubbed, what's left) that is more current than the milestone plan in `ARCHITECTURE.md`. Commit messages in this repo are not reliable narration of what a commit actually contains (verify with `git show --stat` rather than trusting the message) — trust `HANDOFF.md` and the code itself over git history.
 
 ## Commands
 
@@ -26,6 +26,8 @@ cargo deny check                     # license allow-list + banned deps (see den
 
 Linux needs `libxkbcommon-dev` and `pkg-config` system packages for Iced (see `.github/workflows/ci.yml`). CI runs lint (fmt + clippy), test (Linux/macOS/Windows matrix), `cargo audit`, and `cargo deny` on every push/PR to `main`.
 
+The RUSTSEC advisory ignore list is duplicated in three places that must be kept in sync when adding or removing an advisory: `.cargo/audit.toml` (read by the local `cargo audit` CLI), `deny.toml`, and the `ignore:` input on the `rustsec/audit-check` step in `ci.yml` — the GitHub Action does **not** read `.cargo/audit.toml`.
+
 Requires Rust 1.85+ stable (russh 0.62's MSRV).
 
 ## Workspace layout
@@ -35,7 +37,7 @@ Cargo workspace with one binary (`termite`, just calls `termite_app::run()` from
 - **`termite-core`** — shared types (`SessionId`, `HostId`, `HostProfile`, `AuthMethod`, `ConnectionStatus`, `TermiteError`) and core traits (`KeyProvider`, `CredentialStore`). Zero workspace dependencies — every other crate may depend on it, it depends on nothing internal. Does no I/O.
 - **`termite-terminal`** — terminal emulator: VT/ANSI parsing (`vte`), the `TerminalGrid`/`Cell` model, scrollback, PTY management (`portable-pty`). Pure in-memory state; takes bytes in, produces a renderable grid out. Does not render.
 - **`termite-ssh`** — SSH protocol layer built on `russh`: connection lifecycle, auth (password/publickey/agent), host key verification, channels, SFTP, port forwarding, ProxyJump. Knows nothing about Iced or the terminal grid; communicates via `tokio::sync::mpsc` (`SessionEvent` out, `SessionCommand` in).
-- **`termite-crypto`** — SSH key loading/decryption/generation. All key material in `secrecy::SecretVec<u8>`, zeroed on drop via `zeroize`, never logged.
+- **`termite-crypto`** — SSH key loading/decryption/generation. All key material in `secrecy::SecretVec<u8>`, zeroed on drop via `zeroize`, never logged. Its `ssh-key` dependency is pinned to the exact version russh re-exports (`=0.7.0-rc.11`) — never bump one without the other.
 - **`termite-storage`** — persistent state on disk: host profiles and settings as TOML under the platform config dir (`~/.config/termite/` on Linux, `~/Library/Application Support/termite/` on macOS, `%APPDATA%\termite\` on Windows), known_hosts, and the `CredentialStore` implementation wrapping the OS keychain (`keyring`).
 - **`termite-ui`** — reusable Iced widgets (TerminalView, TabBar, SidebarPanel, CommandPalette, etc.) and the theme/color palette (`termite-ui/src/theme.rs`). Takes data from `termite-app`; has no knowledge of SSH or storage.
 - **`termite-app`** — top-level `iced::application` wiring: owns `AppState`, defines the top-level `Message`/`AppMessage` enum, routes messages between the SSH/terminal/storage/UI layers, manages SSH session task lifecycles.
