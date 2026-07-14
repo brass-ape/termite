@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MIT
 //! Top-level application state and Iced wiring for Termite.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use iced::futures::channel::mpsc as bridge;
+use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
 use iced::widget::{row, text};
-use iced::{Element, Font, Length, Subscription, Task, Theme};
+use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
 
-use termite_core::HostProfile;
+use termite_core::{HostProfile, SessionId};
+use termite_ssh::{SessionCommand, SessionEvent, SshSession};
 use termite_storage::{HostStore, MemoryHostStore, TomlHostStore};
 use termite_terminal::{GridHandler, Pty, TerminalGrid};
 use termite_ui::{sidebar, SidebarMessage, SidebarState};
@@ -40,6 +44,14 @@ pub struct TermiteApp {
     host_store: Arc<dyn HostStore>,
     hosts: Vec<HostProfile>,
     sidebar: SidebarState,
+
+    // ── M4: SSH session wiring ────────────────────────────────────────
+    /// Sender into the persistent SSH worker subscription; `None` until its
+    /// first poll delivers `Message::SshWorkerReady`.
+    ssh_worker: Option<bridge::Sender<SshWorkerInput>>,
+    /// The session currently receiving keystrokes and rendering into
+    /// `grid`, if any. `None` means the local shell PTY has focus.
+    active_session: Option<SessionId>,
 }
 
 impl TermiteApp {
@@ -76,6 +88,8 @@ impl TermiteApp {
             host_store: make_host_store(),
             hosts: Vec::new(),
             sidebar: SidebarState::default(),
+            ssh_worker: None,
+            active_session: None,
         })
     }
 
@@ -119,6 +133,89 @@ async fn list_hosts(store: Arc<dyn HostStore>) -> Vec<HostProfile> {
     .unwrap_or_default()
 }
 
+/// Requests sent from the app to the persistent SSH worker subscription
+/// (see [`ssh_worker`]).
+#[derive(Debug, Clone)]
+pub enum SshWorkerInput {
+    /// Spawn a new session connecting to this host profile.
+    Connect(HostProfile),
+    /// Forward a command to an already-spawned session.
+    Send(SessionId, SessionCommand),
+}
+
+/// Runs for the lifetime of the app as an Iced subscription. Owns every
+/// spawned [`SshSession`]'s command sender, keyed by [`SessionId`], and
+/// multiplexes their events back to the app — mirroring the channel
+/// topology in `ARCHITECTURE.md` §6 (one shared `event_tx` per app, one
+/// `command_tx` per session).
+///
+/// The app has no direct handle to this state; it talks to it only via the
+/// `bridge::Sender<SshWorkerInput>` delivered in `Message::SshWorkerReady`
+/// on the first poll, per iced's documented pattern for bidirectional
+/// subscription workers.
+fn ssh_worker() -> impl Stream<Item = Message> {
+    stream::channel(100, |mut output| async move {
+        let (input_tx, mut input_rx) = bridge::channel(32);
+        if output
+            .send(Message::SshWorkerReady(input_tx))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let mut sessions: HashMap<SessionId, tokio::sync::mpsc::Sender<SessionCommand>> =
+            HashMap::new();
+
+        loop {
+            tokio::select! {
+                input = input_rx.next() => {
+                    match input {
+                        Some(SshWorkerInput::Connect(profile)) => {
+                            match termite_ssh::known_hosts::known_hosts_path() {
+                                Ok(known_hosts_path) => {
+                                    let (id, command_tx) =
+                                        SshSession::spawn(profile, known_hosts_path, event_tx.clone());
+                                    sessions.insert(id, command_tx);
+                                }
+                                Err(err) => {
+                                    tracing::error!(%err, "cannot resolve known_hosts path");
+                                }
+                            }
+                        }
+                        Some(SshWorkerInput::Send(id, command)) => {
+                            if let Some(command_tx) = sessions.get(&id) {
+                                let _ = command_tx.send(command).await;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                Some((id, event)) = event_rx.recv() => {
+                    let disconnected = matches!(event, SessionEvent::Disconnected { .. });
+                    if disconnected {
+                        sessions.remove(&id);
+                    }
+                    if output.send(Message::SessionEvent(id, event)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Sends `command` to session `id` via the SSH worker, if it's ready and the
+/// session is still known to it. Silently drops the command otherwise (the
+/// worker itself will already have reported the disconnect as an event).
+fn send_to_session(app: &TermiteApp, id: SessionId, command: SessionCommand) {
+    if let Some(sender) = &app.ssh_worker {
+        let mut sender = sender.clone();
+        let _ = sender.try_send(SshWorkerInput::Send(id, command));
+    }
+}
+
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 /// All messages that flow through the Iced update loop.
@@ -127,9 +224,17 @@ async fn list_hosts(store: Arc<dyn HostStore>) -> Vec<HostProfile> {
 #[derive(Debug, Clone)]
 pub enum Message {
     PollOutput,
-    KeyPressed { key: Key, modifiers: Modifiers },
+    KeyPressed {
+        key: Key,
+        modifiers: Modifiers,
+    },
     HostsLoaded(Vec<HostProfile>),
     Sidebar(SidebarMessage),
+    /// The SSH worker subscription is up; this is the channel to send it
+    /// [`SshWorkerInput`] on.
+    SshWorkerReady(bridge::Sender<SshWorkerInput>),
+    /// An event from a running SSH session, forwarded by the worker.
+    SessionEvent(SessionId, SessionEvent),
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -167,15 +272,66 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
         }
         Message::KeyPressed { key, modifiers } => {
             if let Some(bytes) = key_to_bytes(&key, modifiers) {
-                let _ = app.writer.write_all(&bytes);
+                match app.active_session {
+                    Some(id) => send_to_session(app, id, SessionCommand::Write(bytes)),
+                    None => {
+                        let _ = app.writer.write_all(&bytes);
+                    }
+                }
             }
         }
         Message::HostsLoaded(hosts) => {
             app.hosts = hosts;
         }
         Message::Sidebar(message) => return update_sidebar(app, message),
+        Message::SshWorkerReady(sender) => {
+            app.ssh_worker = Some(sender);
+        }
+        Message::SessionEvent(id, event) => handle_session_event(app, id, event),
     }
     Task::none()
+}
+
+/// Handles an event forwarded from a running SSH session. There is no
+/// dedicated status UI yet (that lands with tabs in M5), so connection
+/// lifecycle transitions are appended to the terminal grid as plain text —
+/// the only surface currently visible to the user.
+///
+/// `AuthRequired` and `HostKeyUnknown`/`HostKeyMismatch` have no prompt UI
+/// yet either. Per `CLAUDE.md`'s security invariants there is no silent-accept
+/// path, so until that UI exists these fail closed: auth requests disconnect,
+/// and host-key prompts are rejected rather than trusted.
+fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent) {
+    match event {
+        SessionEvent::Connected => {
+            app.active_session = Some(id);
+            app.advance(b"\r\n*** connected ***\r\n");
+        }
+        SessionEvent::Output(bytes) => {
+            if app.active_session == Some(id) {
+                app.advance(&bytes);
+            }
+        }
+        SessionEvent::AuthRequired(challenge) => {
+            tracing::warn!(?challenge, "no auth prompt UI yet; disconnecting session");
+            send_to_session(app, id, SessionCommand::Disconnect);
+        }
+        SessionEvent::HostKeyUnknown(key) | SessionEvent::HostKeyMismatch(key) => {
+            tracing::warn!(?key, "no host key approval UI yet; rejecting for safety");
+            send_to_session(app, id, SessionCommand::ApproveHostKey(false));
+        }
+        SessionEvent::Disconnected { reason } => {
+            tracing::info!(?reason, "ssh session disconnected");
+            app.advance(format!("\r\n*** disconnected: {reason:?} ***\r\n").as_bytes());
+            if app.active_session == Some(id) {
+                app.active_session = None;
+            }
+        }
+        SessionEvent::Error(message) => {
+            tracing::error!(%message, "ssh session error");
+            app.advance(format!("\r\n*** error: {message} ***\r\n").as_bytes());
+        }
+    }
 }
 
 fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message> {
@@ -228,9 +384,16 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                 Message::HostsLoaded,
             );
         }
-        SidebarMessage::SelectHost(_id) => {
-            // Connecting to a saved host lands with the SessionCommand/
-            // SessionEvent wiring (tracked separately in HANDOFF.md).
+        SidebarMessage::SelectHost(id) => {
+            if let Some(profile) = app.hosts.iter().find(|host| host.id == id).cloned() {
+                match &app.ssh_worker {
+                    Some(sender) => {
+                        let mut sender = sender.clone();
+                        let _ = sender.try_send(SshWorkerInput::Connect(profile));
+                    }
+                    None => tracing::warn!("ssh worker not ready yet; connect request dropped"),
+                }
+            }
         }
     }
     Task::none()
@@ -252,6 +415,7 @@ fn subscription(_app: &TermiteApp) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(POLL_INTERVAL).map(|_| Message::PollOutput),
         iced::keyboard::on_key_press(|key, modifiers| Some(Message::KeyPressed { key, modifiers })),
+        Subscription::run(ssh_worker),
     ])
 }
 
