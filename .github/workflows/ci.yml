@@ -80,6 +80,11 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check reports results via the Checks API, which needs
+    # write access the default (read-only) GITHUB_TOKEN doesn't have.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       # v2 ships a current cargo-audit, but the action itself (unlike the
