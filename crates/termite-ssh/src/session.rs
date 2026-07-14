@@ -261,7 +261,10 @@ async fn authenticate_password(
     if !send_event(
         event_tx,
         session_id,
-        SessionEvent::AuthRequired(AuthChallenge::Password),
+        SessionEvent::AuthRequired(AuthChallenge::Password {
+            host: profile.host.clone(),
+            username: profile.username.clone(),
+        }),
     )
     .await
     {

@@ -6,7 +6,7 @@
 //! what a submitted credential or approval actually does; this module only
 //! ever sees plain display strings, never SSH types or secret material.
 
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, checkbox, column, container, row, text, text_input};
 use iced::{Border, Color, Element, Length};
 
 use crate::theme::colours;
@@ -18,7 +18,14 @@ pub enum Prompt {
     /// (e.g. "Password for alice@example.com" or a key fingerprint) and is
     /// the caller's responsibility to fill in — this module never sees the
     /// underlying `AuthChallenge`.
-    Credential { label: String, input: String },
+    Credential {
+        label: String,
+        input: String,
+        /// Whether the "Save to keychain" toggle is checked. The caller
+        /// decides what saving actually means (which `CredentialStore` key)
+        /// — this module just tracks the user's yes/no.
+        save: bool,
+    },
     /// The server's host key needs explicit approval. `warning` is set for
     /// a changed key (possible MITM) versus an unrecognised first-contact
     /// key, and drives the modal's colour/wording.
@@ -35,6 +42,7 @@ pub enum Prompt {
 #[derive(Debug, Clone)]
 pub enum PromptMessage {
     InputChanged(String),
+    ToggleSave(bool),
     Submit,
     Cancel,
     Approve,
@@ -46,13 +54,17 @@ pub enum PromptMessage {
 /// only while a prompt is pending.
 pub fn view(prompt: &Prompt) -> Element<'_, PromptMessage> {
     let card: Element<'_, PromptMessage> = match prompt {
-        Prompt::Credential { label, input } => column![
+        Prompt::Credential { label, input, save } => column![
             text(label.clone()).size(14).color(colours::TEXT),
             text_input("", input)
                 .on_input(PromptMessage::InputChanged)
                 .on_submit(PromptMessage::Submit)
                 .secure(true)
                 .size(13),
+            checkbox("Save to keychain", *save)
+                .on_toggle(PromptMessage::ToggleSave)
+                .size(13)
+                .text_size(13),
             row![
                 button(text("Cancel").size(13)).on_press(PromptMessage::Cancel),
                 button(text("Submit").size(13)).on_press(PromptMessage::Submit),

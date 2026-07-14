@@ -42,12 +42,13 @@ pub enum DisconnectReason {
 /// still fails explicitly rather than adding a challenge variant for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthChallenge {
-    Password,
+    /// `host`/`username` identify who the password is for, so the app can
+    /// key a credential-store lookup/save without separately tracking which
+    /// [`crate::HostProfile`] each session belongs to.
+    Password { host: String, username: String },
     /// The key at the configured path is encrypted; `fingerprint` identifies
     /// it for display (never the key material itself).
-    Passphrase {
-        fingerprint: String,
-    },
+    Passphrase { fingerprint: String },
 }
 
 /// The app's answer to an [`AuthChallenge`].

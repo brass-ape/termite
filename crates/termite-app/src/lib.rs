@@ -14,9 +14,9 @@ use iced::widget::{row, text, Stack};
 use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
 use secrecy::SecretString;
 
-use termite_core::{AuthMethod, HostProfile, SessionId};
+use termite_core::{AuthMethod, CredentialStore, HostProfile, SessionId, TermiteError};
 use termite_ssh::{AuthChallenge, AuthResponse, HostKey, SessionCommand, SessionEvent, SshSession};
-use termite_storage::{HostStore, MemoryHostStore, TomlHostStore};
+use termite_storage::{HostStore, KeyringStore, MemoryHostStore, TomlHostStore};
 use termite_terminal::{GridHandler, Pty, TerminalGrid};
 use termite_ui::{prompt, sidebar, AuthKind, Prompt, PromptMessage, SidebarMessage, SidebarState};
 
@@ -45,6 +45,9 @@ pub struct TermiteApp {
     host_store: Arc<dyn HostStore>,
     hosts: Vec<HostProfile>,
     sidebar: SidebarState,
+    /// OS keychain access for the credential prompt's "Save to keychain"
+    /// toggle (see `saved_credential`/`save_credential`).
+    credential_store: Arc<dyn CredentialStore>,
 
     // ── M4: SSH session wiring ────────────────────────────────────────
     /// Sender into the persistent SSH worker subscription; `None` until its
@@ -122,6 +125,7 @@ impl TermiteApp {
             host_store: make_host_store(),
             hosts: Vec::new(),
             sidebar: SidebarState::default(),
+            credential_store: Arc::new(KeyringStore::new()),
             ssh_worker: None,
             active_session: None,
             pending_prompt: None,
@@ -360,8 +364,18 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
                 send_to_session(app, id, SessionCommand::Disconnect);
                 return;
             }
+            if let Some(secret) = saved_credential(app, &challenge) {
+                let response = match &challenge {
+                    AuthChallenge::Password { .. } => AuthResponse::Password(secret),
+                    AuthChallenge::Passphrase { .. } => AuthResponse::Passphrase(secret),
+                };
+                send_to_session(app, id, SessionCommand::AuthResponse(response));
+                return;
+            }
             let label = match &challenge {
-                AuthChallenge::Password => "Password required to continue connecting".to_string(),
+                AuthChallenge::Password { .. } => {
+                    "Password required to continue connecting".to_string()
+                }
                 AuthChallenge::Passphrase { fingerprint } => {
                     format!("Passphrase for key {fingerprint}")
                 }
@@ -372,6 +386,7 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
                 ui: Prompt::Credential {
                     label,
                     input: String::new(),
+                    save: false,
                 },
             });
         }
@@ -394,6 +409,46 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
         SessionEvent::Error(message) => {
             tracing::error!(%message, "ssh session error");
             app.advance(format!("\r\n*** error: {message} ***\r\n").as_bytes());
+        }
+    }
+}
+
+/// Looks up a previously-saved credential for `challenge` in the keychain
+/// (see `save_credential`, called from `update_prompt` on `Submit`). Lookup
+/// failures (e.g. no keychain daemon running) are treated the same as "not
+/// found" — falling back to prompting the user is always safe, unlike
+/// silently failing a connection over a keychain hiccup.
+fn saved_credential(app: &TermiteApp, challenge: &AuthChallenge) -> Option<SecretString> {
+    let result = match challenge {
+        AuthChallenge::Password { host, username } => {
+            app.credential_store.get_password(host, username)
+        }
+        AuthChallenge::Passphrase { fingerprint } => {
+            app.credential_store.get_passphrase(fingerprint)
+        }
+    };
+    match result {
+        Ok(secret) => secret,
+        Err(err) => {
+            tracing::warn!(%err, "credential store lookup failed; falling back to prompt");
+            None
+        }
+    }
+}
+
+/// Saves `secret` to the keychain under the key `challenge` implies, when
+/// the user has checked the prompt's "Save to keychain" toggle.
+fn save_credential(
+    app: &TermiteApp,
+    challenge: &AuthChallenge,
+    secret: &SecretString,
+) -> Result<(), TermiteError> {
+    match challenge {
+        AuthChallenge::Password { host, username } => {
+            app.credential_store.set_password(host, username, secret)
+        }
+        AuthChallenge::Passphrase { fingerprint } => {
+            app.credential_store.set_passphrase(fingerprint, secret)
         }
     }
 }
@@ -447,16 +502,30 @@ fn update_prompt(app: &mut TermiteApp, message: PromptMessage) {
                 *input = value;
             }
         }
+        PromptMessage::ToggleSave(value) => {
+            if let Some(PendingPrompt::Credential {
+                ui: Prompt::Credential { save, .. },
+                ..
+            }) = &mut app.pending_prompt
+            {
+                *save = value;
+            }
+        }
         PromptMessage::Submit => {
             if let Some(PendingPrompt::Credential {
                 session,
                 challenge,
-                ui: Prompt::Credential { input, .. },
+                ui: Prompt::Credential { input, save, .. },
             }) = app.pending_prompt.take()
             {
                 let secret = SecretString::from(input);
+                if save {
+                    if let Err(err) = save_credential(app, &challenge, &secret) {
+                        tracing::error!(%err, "failed to save credential to keychain");
+                    }
+                }
                 let response = match challenge {
-                    AuthChallenge::Password => AuthResponse::Password(secret),
+                    AuthChallenge::Password { .. } => AuthResponse::Password(secret),
                     AuthChallenge::Passphrase { .. } => AuthResponse::Passphrase(secret),
                 };
                 send_to_session(app, session, SessionCommand::AuthResponse(response));
@@ -660,9 +729,16 @@ mod tests {
     use secrecy::ExposeSecret;
     use std::path::PathBuf;
     use termite_ssh::DisconnectReason;
+    use termite_storage::MemoryStore;
 
     fn test_app() -> TermiteApp {
-        TermiteApp::new().expect("failed to spawn local shell pty for test")
+        let mut app = TermiteApp::new().expect("failed to spawn local shell pty for test");
+        // Real `KeyringStore` would work here too (CI runs under a real
+        // Secret Service/Keychain/Credential Manager — see `ci.yml`), but a
+        // `MemoryStore` keeps these tests from writing test credentials into
+        // whatever real keychain happens to be running wherever they're run.
+        app.credential_store = Arc::new(MemoryStore::new());
+        app
     }
 
     fn wire_fake_worker(app: &mut TermiteApp) -> bridge::Receiver<SshWorkerInput> {
@@ -678,6 +754,13 @@ mod tests {
         }
     }
 
+    fn test_password_challenge() -> AuthChallenge {
+        AuthChallenge::Password {
+            host: "example.com".to_string(),
+            username: "alice".to_string(),
+        }
+    }
+
     #[test]
     fn auth_required_password_opens_credential_prompt() {
         let mut app = test_app();
@@ -686,19 +769,20 @@ mod tests {
         handle_session_event(
             &mut app,
             id,
-            SessionEvent::AuthRequired(AuthChallenge::Password),
+            SessionEvent::AuthRequired(test_password_challenge()),
         );
 
         match &app.pending_prompt {
             Some(PendingPrompt::Credential {
                 session,
                 challenge,
-                ui: Prompt::Credential { label, input },
+                ui: Prompt::Credential { label, input, save },
             }) => {
                 assert_eq!(*session, id);
-                assert_eq!(*challenge, AuthChallenge::Password);
+                assert_eq!(*challenge, test_password_challenge());
                 assert!(label.contains("Password"));
                 assert!(input.is_empty());
+                assert!(!save);
             }
             other => panic!("expected a credential prompt, got {other:?}"),
         }
@@ -780,12 +864,12 @@ mod tests {
         handle_session_event(
             &mut app,
             first,
-            SessionEvent::AuthRequired(AuthChallenge::Password),
+            SessionEvent::AuthRequired(test_password_challenge()),
         );
         handle_session_event(
             &mut app,
             second,
-            SessionEvent::AuthRequired(AuthChallenge::Password),
+            SessionEvent::AuthRequired(test_password_challenge()),
         );
 
         match &app.pending_prompt {
@@ -839,7 +923,7 @@ mod tests {
         handle_session_event(
             &mut app,
             id,
-            SessionEvent::AuthRequired(AuthChallenge::Password),
+            SessionEvent::AuthRequired(test_password_challenge()),
         );
         update_prompt(&mut app, PromptMessage::InputChanged("hunter2".to_string()));
         update_prompt(&mut app, PromptMessage::Submit);
@@ -854,6 +938,89 @@ mod tests {
                 assert_eq!(secret.expose_secret(), "hunter2");
             }
             other => panic!("expected a password AuthResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_with_save_checked_persists_password_to_credential_store() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(test_password_challenge()),
+        );
+        update_prompt(&mut app, PromptMessage::InputChanged("hunter2".to_string()));
+        update_prompt(&mut app, PromptMessage::ToggleSave(true));
+        update_prompt(&mut app, PromptMessage::Submit);
+
+        // Submit still answers the challenge as normal...
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SshWorkerInput::Send(
+                _,
+                SessionCommand::AuthResponse(AuthResponse::Password(_))
+            ))
+        ));
+
+        // ...and the credential is now retrievable from the store directly.
+        let saved = app
+            .credential_store
+            .get_password("example.com", "alice")
+            .unwrap()
+            .expect("password should have been saved");
+        assert_eq!(saved.expose_secret(), "hunter2");
+    }
+
+    #[test]
+    fn submit_without_save_does_not_persist_to_credential_store() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(test_password_challenge()),
+        );
+        update_prompt(&mut app, PromptMessage::InputChanged("hunter2".to_string()));
+        update_prompt(&mut app, PromptMessage::Submit);
+        let _ = rx.try_recv();
+
+        assert!(app
+            .credential_store
+            .get_password("example.com", "alice")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn auth_required_auto_answers_from_a_saved_password_without_prompting() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+        app.credential_store
+            .set_password("example.com", "alice", &SecretString::from("hunter2"))
+            .unwrap();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(test_password_challenge()),
+        );
+
+        assert!(app.pending_prompt.is_none());
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(
+                sent_id,
+                SessionCommand::AuthResponse(AuthResponse::Password(secret)),
+            )) => {
+                assert_eq!(sent_id, id);
+                assert_eq!(secret.expose_secret(), "hunter2");
+            }
+            other => panic!("expected an auto-answered password AuthResponse, got {other:?}"),
         }
     }
 
@@ -896,7 +1063,7 @@ mod tests {
         handle_session_event(
             &mut app,
             id,
-            SessionEvent::AuthRequired(AuthChallenge::Password),
+            SessionEvent::AuthRequired(test_password_challenge()),
         );
         update_prompt(&mut app, PromptMessage::Cancel);
 
@@ -952,7 +1119,7 @@ mod tests {
         handle_session_event(
             &mut app,
             id,
-            SessionEvent::AuthRequired(AuthChallenge::Password),
+            SessionEvent::AuthRequired(test_password_challenge()),
         );
         assert!(app.pending_prompt.is_some());
 
@@ -975,7 +1142,7 @@ mod tests {
         handle_session_event(
             &mut app,
             prompting,
-            SessionEvent::AuthRequired(AuthChallenge::Password),
+            SessionEvent::AuthRequired(test_password_challenge()),
         );
 
         handle_session_event(

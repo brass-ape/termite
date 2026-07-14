@@ -167,7 +167,7 @@ async fn full_session_lifecycle_with_persisted_host_key() {
             .unwrap();
 
         match recv_event(&mut event_rx).await {
-            SessionEvent::AuthRequired(AuthChallenge::Password) => {}
+            SessionEvent::AuthRequired(AuthChallenge::Password { .. }) => {}
             other => panic!("expected AuthRequired, got {other:?}"),
         }
         command_tx
@@ -210,7 +210,7 @@ async fn full_session_lifecycle_with_persisted_host_key() {
             SshSession::spawn(profile.clone(), known_hosts_path.clone(), event_tx);
 
         match recv_event(&mut event_rx).await {
-            SessionEvent::AuthRequired(AuthChallenge::Password) => {}
+            SessionEvent::AuthRequired(AuthChallenge::Password { .. }) => {}
             other => {
                 panic!("expected AuthRequired directly (host key already trusted), got {other:?}")
             }
