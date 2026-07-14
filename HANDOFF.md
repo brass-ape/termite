@@ -1,10 +1,26 @@
-# Termite — Conversation Handoff (v7)
+# Termite — Conversation Handoff (v8)
 
-This document gives the next conversation full context to continue development without losing anything. It supersedes v6. **Read this one — CI is now actually green on GitHub (not just locally); M3's protocol layer remains complete and is the last milestone-level state that changed.**
+This document gives the next conversation full context to continue development without losing anything. It supersedes v7. **Read this one — M4 (host management) is now underway: host profiles persist, the sidebar renders and edits them, and selecting a host actually opens a real SSH session. Three commits are local-only, not yet pushed (see Repo state).**
 
 ---
 
-## What happened since v6 (2026-07-14)
+## What happened since v7 (2026-07-14, same day)
+
+M4 work started, in dependency order per `ARCHITECTURE.md`'s checklist (host profile CRUD → sidebar → session wiring):
+
+1. **`HostStore`** (`7a459b7`). New `crates/termite-storage/src/host_store.rs`: a `HostStore` trait (`list`/`get`/`save`/`delete`) mirroring the existing `CredentialStore` pattern, with `TomlHostStore` (disk-backed, `~/.config/termite/hosts.toml`, re-reads/re-writes the whole file every call — deliberately not cached, to avoid staleness vs. hand-edits) and `MemoryHostStore` for tests. 4 unit tests.
+2. **Sidebar UI** (`9dac4ee`). New `crates/termite-ui/src/sidebar.rs`: pure-presentation `sidebar::view()` — a scrollable host list plus an "add host" form — emitting `SidebarMessage`. `termite-app` wires it up: loads hosts asynchronously on startup (`spawn_blocking`, same pattern as settings), persists add/delete through `HostStore`. Verified by rendering (not just compiling) in an isolated Xvfb `:99` display — see "Isolated GUI testing" below for why and how.
+3. **`SessionCommand`/`SessionEvent` wiring** (`c35fd44`, this session). `SidebarMessage::SelectHost` now actually connects. A persistent `Subscription` (`ssh_worker` in `termite-app/src/lib.rs`) owns every spawned `SshSession` keyed by `SessionId`, using iced's documented bidirectional-subscription-worker pattern: it hands the app a `Sender<SshWorkerInput>` via `Message::SshWorkerReady` on first poll (the app can't construct the stream's internal channel itself — the stream owns it), then multiplexes `SessionEvent`s back through `Message::SessionEvent`. Keystrokes route to the active session's channel when connected, else the local PTY as before. Connection lifecycle (connected/disconnected/error) is appended as plain text into the terminal grid — there's no dedicated status UI until tabs land in M5, and that's the only visible surface right now.
+
+**Deliberately deferred, fails closed for now**: `SessionEvent::AuthRequired` and `HostKeyUnknown`/`HostKeyMismatch` have no prompt UI yet. Per `CLAUDE.md`'s no-silent-accept invariant, `handle_session_event` disconnects on an auth challenge and rejects unrecognized/changed host keys rather than guessing — it does not (and must not) auto-approve. This isn't reachable from today's UI anyway: the sidebar's "add host" form has no auth-method picker, so `HostProfile::new`'s default (`AuthMethod::Agent`) is all it ever creates, and agent auth doesn't raise `AuthRequired`. The natural next M4 slice is: an auth-method picker in the add-host form, a passphrase/password prompt dialog, and a host-key-approval dialog — all three need real UI before password/publickey profiles or first-contact hosts are usable end-to-end.
+
+**Verification limits**: no live SSH server was available in this environment to exercise the connect path end-to-end (`sshd` isn't running, and starting it would touch shared system state). `termite-ssh`'s own hermetic integration tests (`tests/session.rs`) already cover the protocol logic this wiring calls into and pass. What *was* verified: `cargo test --workspace` all green, `clippy -D warnings` clean, `fmt` clean, and a rendering smoke test.
+
+**Isolated GUI testing**: running the app for a visual check must not put a window on the user's real desktop. Earlier in this project's history the app was accidentally launched directly and appeared in the user's live Hyprland session — killed immediately once noticed. The safe pattern used since: `Xvfb :99 -screen 0 1280x800x24` (via the Bash tool's `run_in_background`, not shell `&`/`disown` — backgrounding via raw `&` in this sandbox produced a spurious exit 144 on the whole tool call), then `WAYLAND_DISPLAY= DISPLAY=:99 WINIT_UNIX_BACKEND=x11 ./target/debug/termite`, screenshotted via `DISPLAY=:99 import -window root`. **Do not use `ydotool`** to simulate clicks for interaction testing — it injects through `/dev/uinput`, a system-wide kernel input device not scoped to the `:99` display, so it would leak input into the user's real session. This means only rendering can be verified this way, not click-driven interaction; no substitute tool has been found yet.
+
+---
+
+## What happened since v6 (2026-07-14) — history, superseded above
 
 v6 claimed `12b8518` ("fix(ci): unbreak audit/deny/Linux-test jobs") fixed CI but had never actually been watched against a real run — it hadn't. It had in fact already been pushed (v6 was wrong that push was still outstanding) and the real run showed only the `Security Audit` job failing, for two independent reasons fixed in two follow-up commits:
 
@@ -44,8 +60,8 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 ## Repo state
 
 - **Location:** `~/Documents/code/termite`
-- **Git:** `main`, clean, pushed and up to date with `origin/main` at `49c59ea`. CI is green on GitHub (verified via the Actions API, not just assumed).
-- Verify with `git status` / `git show --stat` rather than trusting this document or commit messages blindly — commits `7a39679`/`906634e` are the standing example of why, and `12b8518`'s "unbreak CI" claim (see above) is the same lesson applied to CI status specifically: don't trust "should work" for a GitHub Actions change, check the actual run.
+- **Git:** `main`, working tree clean, but **3 commits ahead of `origin/main`** (`9dac4ee`, `970e428`, `c35fd44` — HostStore, a CLAUDE.md doc sync, and SSH session wiring). Not pushed: working agreement is commit actively, push only when asked, and no push has been asked for since `7a459b7`/`49c59ea`. Don't assume these are on GitHub — CI has not run against them.
+- Verify with `git status` / `git show --stat` rather than trusting this document or commit messages blindly — commits `7a39679`/`906634e` are the standing example of why, and `12b8518`'s "unbreak CI" claim (see v7 section below) is the same lesson applied to CI status specifically: don't trust "should work" for a GitHub Actions change, check the actual run.
 - Environment: Arch, Hyprland/Wayland, Rust 1.97, repo-local git identity, `cargo-audit`/`cargo-deny` binaries in `~/.local/bin`. No `gh` CLI installed — checked Actions status via unauthenticated `curl` against `api.github.com/repos/brass-ape/termite/actions/runs` (works for run/job status on this public repo; job log downloads 403 without admin token).
 
 ---
@@ -58,7 +74,7 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 | **M1** | ✅ Done | Local terminal emulator (PTY + VT + Iced rendering) — verified end-to-end |
 | **M2** | ✅ Done | SSH core (password auth, mandatory known_hosts verification) — hermetic integration test |
 | **M3** | 🟢 Protocol layer done | Key auth + credential storage. Done: ed25519 generate/load/encrypt/decrypt, RSA loading + correct `rsa-sha2-*` hash selection, passphrase decryption + prompt event flow, `KeyProvider`/`LocalKeyProvider`, publickey auth end-to-end, SSH agent auth, `CredentialStore` on the OS keychain, `~/.ssh/config` parsing. **Remaining are UI-facing items that land with M4+**: passphrase prompt dialog, key-gen UI, optional passphrase/password save toggles. ECDSA loading is not enabled (ssh-key `p256` feature undeclared) — deliberate cut unless a user needs it; ed25519/RSA cover the field |
-| M4 | Pending | Host management UI — first real caller for `SessionEvent`/`SessionCommand`, for `SshConfig` alias resolution, and for the M3 UI leftovers |
+| M4 | 🟡 In progress | Host management UI. Done: `HostStore` persistence, sidebar list/add/delete, `SessionEvent`/`SessionCommand` wiring (session actually connects on select). Remaining: auth-method picker in the add-host form, passphrase/password prompt dialog, host-key-approval dialog (all three needed before non-agent auth or first-contact hosts work end-to-end), `SshConfig` alias resolution, key-gen UI |
 | M5–M9 | Pending | Tabs, advanced terminal, forwarding/SFTP/ProxyJump, palette, release |
 
 ---
@@ -66,6 +82,11 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 ## Layout / architecture
 
 Workspace: `termite` binary + `crates/{termite-core,-ssh,-terminal,-storage,-crypto,-ui,-app}`. Dependency graph is one-directional, compiler-enforced, `termite-core` at the bottom with no internal deps. (v4 in git history has the file-by-file M2 walkthrough.)
+
+M4 files so far, all verified:
+- `crates/termite-storage/src/host_store.rs` — `HostStore` trait, `TomlHostStore`, `MemoryHostStore`.
+- `crates/termite-ui/src/sidebar.rs` — `sidebar::view()`, `SidebarMessage`, `SidebarState`. Pure presentation, no `HostStore`/SSH knowledge.
+- `crates/termite-app/src/lib.rs` — `TermiteApp` now holds `host_store`, `hosts`, `sidebar`, `ssh_worker: Option<Sender<SshWorkerInput>>`, `active_session: Option<SessionId>`. The `ssh_worker` free fn is the persistent subscription described above; `handle_session_event` is where `SessionEvent`s land.
 
 M3 files, all verified:
 - `crates/termite-core/src/traits.rs` — `KeyProvider` (`public_key_blob()`, `sign(data, hash_alg)`), `CredentialStore`.
@@ -82,8 +103,9 @@ Security invariants: unchanged from CLAUDE.md, all honored — secrets in `secre
 
 ## Suggested next steps
 
-1. **Start M4 (host management UI)** — CI is settled and M3's protocol surface is complete; M4 is the first consumer of all of it: `SessionEvent`/`SessionCommand` wiring into Iced, host profiles from `termite-storage`, `SshConfig` alias resolution, passphrase prompt dialog, key-gen UI. This is now the only pending item.
+1. **Auth-method picker + prompt dialogs** — the sidebar's add-host form only ever creates `AuthMethod::Agent` profiles, and `AuthRequired`/`HostKeyUnknown`/`HostKeyMismatch` currently fail closed with no UI (see above). Needed together: a way to pick Password/PublicKey/Agent when adding a host, a passphrase/password prompt dialog wired to `AuthResponse`, and a host-key-approval dialog wired to `ApproveHostKey` — otherwise nothing but agent auth against already-trusted hosts is reachable from the UI.
+2. **Decide whether to push** the 3 local-only commits (`9dac4ee`, `970e428`, `c35fd44`) — nothing has asked for a push since `49c59ea`.
 
 ---
 
-*Handoff v7 written after actually verifying CI goes green on GitHub (two real bugs in the audit-check step, both fixed and confirmed against a live run). v6 had claimed this was done and pushed; neither was true yet. Working agreement: commit actively as work lands (the user asked for this explicitly); push only when asked.*
+*Handoff v8 written after wiring real `SessionEvent`/`SessionCommand` handling into `termite-app` on top of the HostStore/sidebar work from earlier the same day. v7's CI-fix content is kept below for history. Working agreement: commit actively as work lands (the user asked for this explicitly); push only when asked.*
