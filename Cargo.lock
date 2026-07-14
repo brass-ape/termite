@@ -5021,9 +5021,11 @@ dependencies = [
 name = "termite-storage"
 version = "0.1.0"
 dependencies = [
+ "dirs 5.0.1",
  "keyring",
  "secrecy",
  "serde",
+ "tempfile",
  "termite-core",
  "thiserror 2.0.18",
  "toml",
