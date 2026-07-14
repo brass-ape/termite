@@ -15,7 +15,10 @@ use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
 use secrecy::SecretString;
 
 use termite_core::{AuthMethod, CredentialStore, HostProfile, SessionId, TermiteError};
-use termite_ssh::{AuthChallenge, AuthResponse, HostKey, SessionCommand, SessionEvent, SshSession};
+use termite_ssh::{
+    AuthChallenge, AuthResponse, HostConfig, HostKey, SessionCommand, SessionEvent, SshConfig,
+    SshSession,
+};
 use termite_storage::{HostStore, KeyringStore, MemoryHostStore, TomlHostStore};
 use termite_terminal::{GridHandler, Pty, TerminalGrid};
 use termite_ui::{prompt, sidebar, AuthKind, Prompt, PromptMessage, SidebarMessage, SidebarState};
@@ -45,6 +48,11 @@ pub struct TermiteApp {
     host_store: Arc<dyn HostStore>,
     hosts: Vec<HostProfile>,
     sidebar: SidebarState,
+    /// Parsed `~/.ssh/config`, used to resolve `Host` aliases typed into the
+    /// add-host form's address field (see `SidebarMessage::ResolveAlias`).
+    /// Loaded once at startup; a file that changes after launch isn't
+    /// picked up until the app restarts, same as saved host profiles.
+    ssh_config: SshConfig,
     /// OS keychain access for the credential prompt's "Save to keychain"
     /// toggle (see `saved_credential`/`save_credential`).
     credential_store: Arc<dyn CredentialStore>,
@@ -125,6 +133,7 @@ impl TermiteApp {
             host_store: make_host_store(),
             hosts: Vec::new(),
             sidebar: SidebarState::default(),
+            ssh_config: load_ssh_config(),
             credential_store: Arc::new(KeyringStore::new()),
             ssh_worker: None,
             active_session: None,
@@ -153,6 +162,22 @@ fn make_host_store() -> Arc<dyn HostStore> {
             tracing::warn!("no platform config directory; host profiles won't persist");
             Arc::new(MemoryHostStore::new())
         }
+    }
+}
+
+/// Loads and parses `~/.ssh/config` for alias resolution in the add-host
+/// form. Read synchronously — same reasoning as the PTY spawn a few lines
+/// above `new()`'s call site: it's a small local file, not worth a `Task`.
+/// No config file resolves to an empty `SshConfig` (see `SshConfig::load`);
+/// a malformed one logs a warning and also resolves empty rather than
+/// failing app startup over a form-autofill convenience feature.
+fn load_ssh_config() -> SshConfig {
+    match termite_ssh::ssh_config::default_path() {
+        Some(path) => SshConfig::load(&path).unwrap_or_else(|err| {
+            tracing::warn!(%err, "failed to parse ~/.ssh/config; alias resolution disabled");
+            SshConfig::default()
+        }),
+        None => SshConfig::default(),
     }
 }
 
@@ -563,6 +588,47 @@ fn auth_method_from_form(kind: AuthKind, key_path: String) -> AuthMethod {
     }
 }
 
+/// Applies a `~/.ssh/config` alias resolution to the add-host form. Only
+/// fills in fields the user hasn't already typed a value into — a later
+/// manual edit always wins over a config default — except the address
+/// field itself and the port, where overwriting *is* the point of hitting
+/// Enter on an alias. Called only when `resolved` is non-default; an
+/// unmatched alias leaves the form untouched.
+fn apply_resolved_config(sidebar: &mut SidebarState, resolved: &HostConfig) {
+    if let Some(host_name) = &resolved.host_name {
+        sidebar.address_input = host_name.clone();
+    }
+    if sidebar.username_input.is_empty() {
+        if let Some(user) = &resolved.user {
+            sidebar.username_input = user.clone();
+        }
+    }
+    if resolved.port.is_some() {
+        sidebar.resolved_port = resolved.port;
+    }
+    if sidebar.auth_kind == AuthKind::Agent {
+        if let Some(key_path) = resolved.identity_files.first() {
+            sidebar.auth_kind = AuthKind::PublicKey;
+            sidebar.key_path_input = key_path.display().to_string();
+        }
+    }
+    sidebar.resolved_hint = Some(resolution_hint(sidebar, resolved));
+}
+
+/// The text shown under the address field after a successful resolution.
+fn resolution_hint(sidebar: &SidebarState, resolved: &HostConfig) -> String {
+    let user_part = if sidebar.username_input.is_empty() {
+        String::new()
+    } else {
+        format!("{}@", sidebar.username_input)
+    };
+    format!(
+        "~/.ssh/config \u{2192} {user_part}{}:{}",
+        sidebar.address_input,
+        resolved.port.or(sidebar.resolved_port).unwrap_or(22)
+    )
+}
+
 fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message> {
     match message {
         SidebarMessage::NameInputChanged(value) => {
@@ -570,6 +636,11 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
         }
         SidebarMessage::AddressInputChanged(value) => {
             app.sidebar.address_input = value;
+            // A prior resolution no longer describes the (now-different)
+            // address; ResolveAlias will re-derive it if the new value
+            // also happens to be an alias.
+            app.sidebar.resolved_port = None;
+            app.sidebar.resolved_hint = None;
         }
         SidebarMessage::UsernameInputChanged(value) => {
             app.sidebar.username_input = value;
@@ -579,6 +650,12 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
         }
         SidebarMessage::KeyPathInputChanged(value) => {
             app.sidebar.key_path_input = value;
+        }
+        SidebarMessage::ResolveAlias => {
+            let resolved = app.ssh_config.query(&app.sidebar.address_input);
+            if resolved != HostConfig::default() {
+                apply_resolved_config(&mut app.sidebar, &resolved);
+            }
         }
         SidebarMessage::AddHost => {
             // A public-key profile with no path would fail to connect with
@@ -595,11 +672,13 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                     std::mem::take(&mut app.sidebar.address_input),
                     std::mem::take(&mut app.sidebar.username_input),
                 );
+                profile.port = app.sidebar.resolved_port.take().unwrap_or(22);
                 profile.auth = auth_method_from_form(
                     app.sidebar.auth_kind,
                     std::mem::take(&mut app.sidebar.key_path_input),
                 );
                 app.sidebar.auth_kind = AuthKind::default();
+                app.sidebar.resolved_hint = None;
                 let store = Arc::clone(&app.host_store);
                 return Task::perform(
                     async move {
@@ -1175,5 +1254,135 @@ mod tests {
                 key_path: PathBuf::from("/home/user/.ssh/id_ed25519"),
             },
         );
+    }
+
+    #[test]
+    fn apply_resolved_config_fills_empty_fields_and_sets_hint() {
+        let mut sidebar = SidebarState {
+            address_input: "work".to_string(),
+            ..SidebarState::default()
+        };
+        let resolved = HostConfig {
+            host_name: Some("gitlab.internal.example.com".to_string()),
+            user: Some("deploy".to_string()),
+            port: Some(2222),
+            ..HostConfig::default()
+        };
+
+        apply_resolved_config(&mut sidebar, &resolved);
+
+        assert_eq!(sidebar.address_input, "gitlab.internal.example.com");
+        assert_eq!(sidebar.username_input, "deploy");
+        assert_eq!(sidebar.resolved_port, Some(2222));
+        assert_eq!(sidebar.auth_kind, AuthKind::Agent);
+        assert_eq!(
+            sidebar.resolved_hint.as_deref(),
+            Some("~/.ssh/config \u{2192} deploy@gitlab.internal.example.com:2222")
+        );
+    }
+
+    #[test]
+    fn apply_resolved_config_does_not_override_a_typed_username() {
+        let mut sidebar = SidebarState {
+            address_input: "work".to_string(),
+            username_input: "alice".to_string(),
+            ..SidebarState::default()
+        };
+        let resolved = HostConfig {
+            user: Some("bob".to_string()),
+            ..HostConfig::default()
+        };
+
+        apply_resolved_config(&mut sidebar, &resolved);
+
+        assert_eq!(sidebar.username_input, "alice");
+    }
+
+    #[test]
+    fn apply_resolved_config_switches_to_public_key_auth_when_a_key_is_resolved() {
+        let mut sidebar = SidebarState::default();
+        let resolved = HostConfig {
+            identity_files: vec![PathBuf::from("/keys/id_ed25519")],
+            ..HostConfig::default()
+        };
+
+        apply_resolved_config(&mut sidebar, &resolved);
+
+        assert_eq!(sidebar.auth_kind, AuthKind::PublicKey);
+        assert_eq!(sidebar.key_path_input, "/keys/id_ed25519");
+    }
+
+    #[test]
+    fn apply_resolved_config_does_not_override_an_explicit_auth_kind() {
+        let mut sidebar = SidebarState {
+            auth_kind: AuthKind::Password,
+            ..SidebarState::default()
+        };
+        let resolved = HostConfig {
+            identity_files: vec![PathBuf::from("/keys/id_ed25519")],
+            ..HostConfig::default()
+        };
+
+        apply_resolved_config(&mut sidebar, &resolved);
+
+        assert_eq!(sidebar.auth_kind, AuthKind::Password);
+        assert!(sidebar.key_path_input.is_empty());
+    }
+
+    #[test]
+    fn resolve_alias_message_matches_a_configured_host() {
+        let mut app = test_app();
+        app.ssh_config =
+            SshConfig::parse("Host work\n\tHostName gitlab.internal.example.com\n\tPort 2222\n")
+                .expect("valid ssh_config text");
+        app.sidebar.address_input = "work".to_string();
+
+        let _ = update_sidebar(&mut app, SidebarMessage::ResolveAlias);
+
+        assert_eq!(app.sidebar.address_input, "gitlab.internal.example.com");
+        assert_eq!(app.sidebar.resolved_port, Some(2222));
+        assert!(app.sidebar.resolved_hint.is_some());
+    }
+
+    #[test]
+    fn resolve_alias_message_is_a_no_op_for_an_unmatched_address() {
+        let mut app = test_app();
+        app.sidebar.address_input = "no-such-alias.example.com".to_string();
+
+        let _ = update_sidebar(&mut app, SidebarMessage::ResolveAlias);
+
+        assert_eq!(app.sidebar.address_input, "no-such-alias.example.com");
+        assert_eq!(app.sidebar.resolved_port, None);
+        assert_eq!(app.sidebar.resolved_hint, None);
+    }
+
+    #[test]
+    fn changing_the_address_clears_a_stale_resolution() {
+        let mut app = test_app();
+        app.sidebar.resolved_port = Some(2222);
+        app.sidebar.resolved_hint = Some("stale".to_string());
+
+        let _ = update_sidebar(
+            &mut app,
+            SidebarMessage::AddressInputChanged("something-else".to_string()),
+        );
+
+        assert_eq!(app.sidebar.resolved_port, None);
+        assert_eq!(app.sidebar.resolved_hint, None);
+    }
+
+    #[test]
+    fn add_host_consumes_and_resets_the_resolved_port_and_hint() {
+        let mut app = test_app();
+        app.sidebar.name_input = "Work".to_string();
+        app.sidebar.address_input = "gitlab.internal.example.com".to_string();
+        app.sidebar.username_input = "deploy".to_string();
+        app.sidebar.resolved_port = Some(2222);
+        app.sidebar.resolved_hint = Some("~/.ssh/config \u{2192} deploy@host:2222".to_string());
+
+        let _ = update_sidebar(&mut app, SidebarMessage::AddHost);
+
+        assert_eq!(app.sidebar.resolved_port, None);
+        assert_eq!(app.sidebar.resolved_hint, None);
     }
 }

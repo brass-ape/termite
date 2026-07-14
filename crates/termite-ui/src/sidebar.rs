@@ -44,6 +44,10 @@ pub enum SidebarMessage {
     UsernameInputChanged(String),
     AuthKindSelected(AuthKind),
     KeyPathInputChanged(String),
+    /// The address field's Enter key was pressed — the caller should try to
+    /// resolve it as a `~/.ssh/config` `Host` alias and, on a match, fill in
+    /// whatever fields the user hasn't already typed over.
+    ResolveAlias,
     AddHost,
     DeleteHost(HostId),
     SelectHost(HostId),
@@ -58,6 +62,15 @@ pub struct SidebarState {
     pub username_input: String,
     pub auth_kind: AuthKind,
     pub key_path_input: String,
+    /// Port resolved from `~/.ssh/config` for the current address, if
+    /// `ResolveAlias` found one. There's no manual port field in this form
+    /// (pre-existing gap, unrelated to alias resolution) — `None` means the
+    /// caller should fall back to the default port 22.
+    pub resolved_port: Option<u16>,
+    /// Human-readable summary of the last successful alias resolution,
+    /// shown under the address field. `None` when nothing has been
+    /// resolved yet, or the address has changed since.
+    pub resolved_hint: Option<String>,
 }
 
 /// Renders the sidebar: a scrollable host list above a compact "add host"
@@ -81,9 +94,13 @@ pub fn view<'a>(hosts: &'a [HostProfile], state: &'a SidebarState) -> Element<'a
         text_input("Name", &state.name_input)
             .on_input(SidebarMessage::NameInputChanged)
             .size(13),
-        text_input("host.example.com", &state.address_input)
-            .on_input(SidebarMessage::AddressInputChanged)
-            .size(13),
+        text_input(
+            "host.example.com or a ~/.ssh/config alias",
+            &state.address_input
+        )
+        .on_input(SidebarMessage::AddressInputChanged)
+        .on_submit(SidebarMessage::ResolveAlias)
+        .size(13),
         text_input("username", &state.username_input)
             .on_input(SidebarMessage::UsernameInputChanged)
             .size(13),
@@ -91,6 +108,10 @@ pub fn view<'a>(hosts: &'a [HostProfile], state: &'a SidebarState) -> Element<'a
     ]
     .spacing(6)
     .padding(8);
+
+    if let Some(hint) = &state.resolved_hint {
+        form = form.push(text(hint.clone()).size(11).color(colours::TEXT_MUTED));
+    }
 
     if state.auth_kind == AuthKind::PublicKey {
         form = form.push(
