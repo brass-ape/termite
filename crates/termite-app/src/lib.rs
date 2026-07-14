@@ -7,10 +7,13 @@ use std::time::Duration;
 
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
-use iced::widget::text;
-use iced::{Element, Font, Subscription, Task, Theme};
+use iced::widget::{row, text};
+use iced::{Element, Font, Length, Subscription, Task, Theme};
 
+use termite_core::HostProfile;
+use termite_storage::{HostStore, MemoryHostStore, TomlHostStore};
 use termite_terminal::{GridHandler, Pty, TerminalGrid};
+use termite_ui::{sidebar, SidebarMessage, SidebarState};
 
 /// Default grid size until real window-size-driven resizing lands (M6).
 const ROWS: usize = 30;
@@ -32,6 +35,11 @@ pub struct TermiteApp {
     /// Kept alive so the pty and child shell aren't torn down; unused
     /// otherwise until session lifecycle (M2+) needs it.
     _pty: Pty,
+
+    // ── M4: host management ──────────────────────────────────────────
+    host_store: Arc<dyn HostStore>,
+    hosts: Vec<HostProfile>,
+    sidebar: SidebarState,
 }
 
 impl TermiteApp {
@@ -65,6 +73,9 @@ impl TermiteApp {
             output,
             writer,
             _pty: pty,
+            host_store: make_host_store(),
+            hosts: Vec::new(),
+            sidebar: SidebarState::default(),
         })
     }
 
@@ -79,6 +90,35 @@ impl TermiteApp {
     }
 }
 
+/// The real on-disk store where the platform has a config dir, falling back
+/// to an in-memory store (e.g. headless/sandboxed test environments) rather
+/// than failing startup over host profile persistence.
+fn make_host_store() -> Arc<dyn HostStore> {
+    match TomlHostStore::default_path() {
+        Some(path) => Arc::new(TomlHostStore::new(path)),
+        None => {
+            tracing::warn!("no platform config directory; host profiles won't persist");
+            Arc::new(MemoryHostStore::new())
+        }
+    }
+}
+
+/// Loads all saved host profiles off the main thread.
+fn load_hosts_task(store: Arc<dyn HostStore>) -> Task<Message> {
+    Task::perform(list_hosts(store), Message::HostsLoaded)
+}
+
+async fn list_hosts(store: Arc<dyn HostStore>) -> Vec<HostProfile> {
+    tokio::task::spawn_blocking(move || {
+        store.list().unwrap_or_else(|err| {
+            tracing::error!(%err, "failed to list host profiles");
+            Vec::new()
+        })
+    })
+    .await
+    .unwrap_or_default()
+}
+
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 /// All messages that flow through the Iced update loop.
@@ -88,6 +128,8 @@ impl TermiteApp {
 pub enum Message {
     PollOutput,
     KeyPressed { key: Key, modifiers: Modifiers },
+    HostsLoaded(Vec<HostProfile>),
+    Sidebar(SidebarMessage),
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -104,7 +146,8 @@ pub fn run() -> iced::Result {
 
 fn initialize() -> (TermiteApp, Task<Message>) {
     let app = TermiteApp::new().expect("failed to spawn local shell pty");
-    (app, Task::none())
+    let load = load_hosts_task(Arc::clone(&app.host_store));
+    (app, load)
 }
 
 // ── Iced functions ────────────────────────────────────────────────────────────
@@ -127,13 +170,82 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
                 let _ = app.writer.write_all(&bytes);
             }
         }
+        Message::HostsLoaded(hosts) => {
+            app.hosts = hosts;
+        }
+        Message::Sidebar(message) => return update_sidebar(app, message),
+    }
+    Task::none()
+}
+
+fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message> {
+    match message {
+        SidebarMessage::NameInputChanged(value) => {
+            app.sidebar.name_input = value;
+        }
+        SidebarMessage::AddressInputChanged(value) => {
+            app.sidebar.address_input = value;
+        }
+        SidebarMessage::UsernameInputChanged(value) => {
+            app.sidebar.username_input = value;
+        }
+        SidebarMessage::AddHost => {
+            if !app.sidebar.name_input.is_empty() && !app.sidebar.address_input.is_empty() {
+                let profile = HostProfile::new(
+                    std::mem::take(&mut app.sidebar.name_input),
+                    std::mem::take(&mut app.sidebar.address_input),
+                    std::mem::take(&mut app.sidebar.username_input),
+                );
+                let store = Arc::clone(&app.host_store);
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(err) = store.save(profile) {
+                                tracing::error!(%err, "failed to save host profile");
+                            }
+                            store.list().unwrap_or_default()
+                        })
+                        .await
+                        .unwrap_or_default()
+                    },
+                    Message::HostsLoaded,
+                );
+            }
+        }
+        SidebarMessage::DeleteHost(id) => {
+            let store = Arc::clone(&app.host_store);
+            return Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(err) = store.delete(id) {
+                            tracing::error!(%err, "failed to delete host profile");
+                        }
+                        store.list().unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
+                },
+                Message::HostsLoaded,
+            );
+        }
+        SidebarMessage::SelectHost(_id) => {
+            // Connecting to a saved host lands with the SessionCommand/
+            // SessionEvent wiring (tracked separately in HANDOFF.md).
+        }
     }
     Task::none()
 }
 
 fn view(app: &TermiteApp) -> Element<'_, Message> {
+    let sidebar = sidebar::view(&app.hosts, &app.sidebar).map(Message::Sidebar);
+
     let rows = app.grid.visible_rows().join("\n");
-    text(rows).font(Font::MONOSPACE).size(14).into()
+    let terminal = text(rows)
+        .font(Font::MONOSPACE)
+        .size(14)
+        .width(Length::Fill);
+
+    row![sidebar, terminal].into()
 }
 
 fn subscription(_app: &TermiteApp) -> Subscription<Message> {

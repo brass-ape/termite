@@ -4969,6 +4969,7 @@ dependencies = [
  "termite-storage",
  "termite-terminal",
  "termite-ui",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "vte",
