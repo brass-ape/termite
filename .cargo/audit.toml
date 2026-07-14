@@ -1,4 +1,6 @@
-# cargo-audit configuration — keep in sync with deny.toml's [advisories].
+# cargo-audit configuration — keep in sync with deny.toml's [advisories] AND
+# the `ignore:` input on the rustsec/audit-check step in ci.yml, which does
+# not read this file itself.
 
 [advisories]
 ignore = [

@@ -82,11 +82,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # v2 ships a current cargo-audit that reads .cargo/audit.toml (v1's
-      # predates our advisory-ignore config and fails on it).
+      # v2 ships a current cargo-audit, but the action itself (unlike the
+      # cargo-audit CLI) does not read .cargo/audit.toml — its ignore list
+      # must be passed as an input, kept in sync with that file and deny.toml.
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
   # ── Dependency policy ──────────────────────────────────────────────────────
   deny:
