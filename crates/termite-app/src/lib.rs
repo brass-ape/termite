@@ -10,14 +10,15 @@ use iced::futures::channel::mpsc as bridge;
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
-use iced::widget::{row, text};
+use iced::widget::{row, text, Stack};
 use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
+use secrecy::SecretString;
 
-use termite_core::{HostProfile, SessionId};
-use termite_ssh::{SessionCommand, SessionEvent, SshSession};
+use termite_core::{AuthMethod, HostProfile, SessionId};
+use termite_ssh::{AuthChallenge, AuthResponse, HostKey, SessionCommand, SessionEvent, SshSession};
 use termite_storage::{HostStore, MemoryHostStore, TomlHostStore};
 use termite_terminal::{GridHandler, Pty, TerminalGrid};
-use termite_ui::{sidebar, SidebarMessage, SidebarState};
+use termite_ui::{prompt, sidebar, AuthKind, Prompt, PromptMessage, SidebarMessage, SidebarState};
 
 /// Default grid size until real window-size-driven resizing lands (M6).
 const ROWS: usize = 30;
@@ -52,6 +53,38 @@ pub struct TermiteApp {
     /// The session currently receiving keystrokes and rendering into
     /// `grid`, if any. `None` means the local shell PTY has focus.
     active_session: Option<SessionId>,
+    /// A credential or host-key prompt currently blocking a session,
+    /// waiting on the user. `None` means no modal is shown. Only one prompt
+    /// is surfaced at a time; per `CLAUDE.md`'s no-silent-accept invariant,
+    /// a second prompt arriving while one is already pending fails closed
+    /// (see `handle_session_event`) rather than silently overwriting it.
+    pending_prompt: Option<PendingPrompt>,
+}
+
+/// A prompt awaiting the user's decision, plus enough of the originating
+/// `SessionEvent` to act on that decision once it's made. `ui` is the plain,
+/// SSH-type-free display data `termite_ui::prompt::view` renders — embedded
+/// directly (rather than derived on each `view()` call) so the modal's
+/// `Element` can borrow it with `app`'s lifetime instead of a temporary's.
+enum PendingPrompt {
+    Credential {
+        session: SessionId,
+        challenge: AuthChallenge,
+        ui: Prompt,
+    },
+    HostKey {
+        session: SessionId,
+        ui: Prompt,
+    },
+}
+
+impl PendingPrompt {
+    fn ui(&self) -> &Prompt {
+        match self {
+            PendingPrompt::Credential { ui, .. } => ui,
+            PendingPrompt::HostKey { ui, .. } => ui,
+        }
+    }
 }
 
 impl TermiteApp {
@@ -90,6 +123,7 @@ impl TermiteApp {
             sidebar: SidebarState::default(),
             ssh_worker: None,
             active_session: None,
+            pending_prompt: None,
         })
     }
 
@@ -235,6 +269,8 @@ pub enum Message {
     SshWorkerReady(bridge::Sender<SshWorkerInput>),
     /// An event from a running SSH session, forwarded by the worker.
     SessionEvent(SessionId, SessionEvent),
+    /// Interaction with the pending credential/host-key modal, if any.
+    Prompt(PromptMessage),
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -288,6 +324,7 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
             app.ssh_worker = Some(sender);
         }
         Message::SessionEvent(id, event) => handle_session_event(app, id, event),
+        Message::Prompt(message) => update_prompt(app, message),
     }
     Task::none()
 }
@@ -297,10 +334,11 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
 /// lifecycle transitions are appended to the terminal grid as plain text —
 /// the only surface currently visible to the user.
 ///
-/// `AuthRequired` and `HostKeyUnknown`/`HostKeyMismatch` have no prompt UI
-/// yet either. Per `CLAUDE.md`'s security invariants there is no silent-accept
-/// path, so until that UI exists these fail closed: auth requests disconnect,
-/// and host-key prompts are rejected rather than trusted.
+/// `AuthRequired` and `HostKeyUnknown`/`HostKeyMismatch` open the credential
+/// or host-key modal (see `update_prompt`). Per `CLAUDE.md`'s no-silent-accept
+/// invariant, only one prompt is shown at a time: if a second one arrives
+/// while the modal is already open, it fails closed (auth disconnects,
+/// host-key rejects) rather than silently overwriting the pending decision.
 fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent) {
     match event {
         SessionEvent::Connected => {
@@ -313,12 +351,34 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
             }
         }
         SessionEvent::AuthRequired(challenge) => {
-            tracing::warn!(?challenge, "no auth prompt UI yet; disconnecting session");
-            send_to_session(app, id, SessionCommand::Disconnect);
+            if app.pending_prompt.is_some() {
+                tracing::warn!(
+                    ?challenge,
+                    "a prompt is already pending; disconnecting session"
+                );
+                send_to_session(app, id, SessionCommand::Disconnect);
+                return;
+            }
+            let label = match &challenge {
+                AuthChallenge::Password => "Password required to continue connecting".to_string(),
+                AuthChallenge::Passphrase { fingerprint } => {
+                    format!("Passphrase for key {fingerprint}")
+                }
+            };
+            app.pending_prompt = Some(PendingPrompt::Credential {
+                session: id,
+                challenge,
+                ui: Prompt::Credential {
+                    label,
+                    input: String::new(),
+                },
+            });
         }
-        SessionEvent::HostKeyUnknown(key) | SessionEvent::HostKeyMismatch(key) => {
-            tracing::warn!(?key, "no host key approval UI yet; rejecting for safety");
-            send_to_session(app, id, SessionCommand::ApproveHostKey(false));
+        SessionEvent::HostKeyUnknown(key) => {
+            open_host_key_prompt(app, id, key, false);
+        }
+        SessionEvent::HostKeyMismatch(key) => {
+            open_host_key_prompt(app, id, key, true);
         }
         SessionEvent::Disconnected { reason } => {
             tracing::info!(?reason, "ssh session disconnected");
@@ -326,10 +386,95 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
             if app.active_session == Some(id) {
                 app.active_session = None;
             }
+            if pending_prompt_session(&app.pending_prompt) == Some(id) {
+                app.pending_prompt = None;
+            }
         }
         SessionEvent::Error(message) => {
             tracing::error!(%message, "ssh session error");
             app.advance(format!("\r\n*** error: {message} ***\r\n").as_bytes());
+        }
+    }
+}
+
+/// The session a pending prompt (if any) belongs to.
+fn pending_prompt_session(pending: &Option<PendingPrompt>) -> Option<SessionId> {
+    match pending {
+        Some(PendingPrompt::Credential { session, .. }) => Some(*session),
+        Some(PendingPrompt::HostKey { session, .. }) => Some(*session),
+        None => None,
+    }
+}
+
+/// Opens the host-key approval modal, or fails closed by rejecting the key
+/// if a different prompt is already pending (see `handle_session_event`).
+fn open_host_key_prompt(app: &mut TermiteApp, session: SessionId, key: HostKey, mismatch: bool) {
+    if app.pending_prompt.is_some() {
+        tracing::warn!(
+            ?key,
+            mismatch,
+            "a prompt is already pending; rejecting for safety"
+        );
+        send_to_session(app, session, SessionCommand::ApproveHostKey(false));
+        return;
+    }
+    let label = if mismatch {
+        "Host key changed! This may indicate an attack — verify before trusting.".to_string()
+    } else {
+        "New host — verify the key fingerprint before trusting it.".to_string()
+    };
+    app.pending_prompt = Some(PendingPrompt::HostKey {
+        session,
+        ui: Prompt::HostKey {
+            label,
+            algorithm: key.algorithm,
+            fingerprint: key.fingerprint,
+            warning: mismatch,
+        },
+    });
+}
+
+/// Handles interaction with the pending credential/host-key modal.
+fn update_prompt(app: &mut TermiteApp, message: PromptMessage) {
+    match message {
+        PromptMessage::InputChanged(value) => {
+            if let Some(PendingPrompt::Credential {
+                ui: Prompt::Credential { input, .. },
+                ..
+            }) = &mut app.pending_prompt
+            {
+                *input = value;
+            }
+        }
+        PromptMessage::Submit => {
+            if let Some(PendingPrompt::Credential {
+                session,
+                challenge,
+                ui: Prompt::Credential { input, .. },
+            }) = app.pending_prompt.take()
+            {
+                let secret = SecretString::from(input);
+                let response = match challenge {
+                    AuthChallenge::Password => AuthResponse::Password(secret),
+                    AuthChallenge::Passphrase { .. } => AuthResponse::Passphrase(secret),
+                };
+                send_to_session(app, session, SessionCommand::AuthResponse(response));
+            }
+        }
+        PromptMessage::Cancel => {
+            if let Some(PendingPrompt::Credential { session, .. }) = app.pending_prompt.take() {
+                send_to_session(app, session, SessionCommand::Disconnect);
+            }
+        }
+        PromptMessage::Approve => {
+            if let Some(PendingPrompt::HostKey { session, .. }) = app.pending_prompt.take() {
+                send_to_session(app, session, SessionCommand::ApproveHostKey(true));
+            }
+        }
+        PromptMessage::Reject => {
+            if let Some(PendingPrompt::HostKey { session, .. }) = app.pending_prompt.take() {
+                send_to_session(app, session, SessionCommand::ApproveHostKey(false));
+            }
         }
     }
 }
@@ -345,13 +490,35 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
         SidebarMessage::UsernameInputChanged(value) => {
             app.sidebar.username_input = value;
         }
+        SidebarMessage::AuthKindSelected(kind) => {
+            app.sidebar.auth_kind = kind;
+        }
+        SidebarMessage::KeyPathInputChanged(value) => {
+            app.sidebar.key_path_input = value;
+        }
         SidebarMessage::AddHost => {
-            if !app.sidebar.name_input.is_empty() && !app.sidebar.address_input.is_empty() {
-                let profile = HostProfile::new(
+            // A public-key profile with no path would fail to connect with
+            // no way to fix it short of deleting and re-adding the host, so
+            // it's rejected here rather than saved.
+            let key_path_ok = app.sidebar.auth_kind != AuthKind::PublicKey
+                || !app.sidebar.key_path_input.is_empty();
+            if !app.sidebar.name_input.is_empty()
+                && !app.sidebar.address_input.is_empty()
+                && key_path_ok
+            {
+                let mut profile = HostProfile::new(
                     std::mem::take(&mut app.sidebar.name_input),
                     std::mem::take(&mut app.sidebar.address_input),
                     std::mem::take(&mut app.sidebar.username_input),
                 );
+                profile.auth = match app.sidebar.auth_kind {
+                    AuthKind::Agent => AuthMethod::Agent,
+                    AuthKind::Password => AuthMethod::Password,
+                    AuthKind::PublicKey => AuthMethod::PublicKey {
+                        key_path: std::mem::take(&mut app.sidebar.key_path_input).into(),
+                    },
+                };
+                app.sidebar.auth_kind = AuthKind::default();
                 let store = Arc::clone(&app.host_store);
                 return Task::perform(
                     async move {
@@ -408,7 +575,15 @@ fn view(app: &TermiteApp) -> Element<'_, Message> {
         .size(14)
         .width(Length::Fill);
 
-    row![sidebar, terminal].into()
+    let content: Element<'_, Message> = row![sidebar, terminal].into();
+
+    match &app.pending_prompt {
+        Some(pending) => {
+            let modal = prompt::view(pending.ui()).map(Message::Prompt);
+            Stack::new().push(content).push(modal).into()
+        }
+        None => content,
+    }
 }
 
 fn subscription(_app: &TermiteApp) -> Subscription<Message> {

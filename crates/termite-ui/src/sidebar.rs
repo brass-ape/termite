@@ -10,6 +10,30 @@ use termite_core::{HostId, HostProfile};
 
 use crate::theme::colours;
 
+/// Which authentication method the add-host form currently has selected.
+/// Kept separate from [`termite_core::AuthMethod`] because the form needs a
+/// selectable "public key" state before a key path has been typed in, which
+/// `AuthMethod::PublicKey`'s mandatory `PathBuf` can't represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthKind {
+    #[default]
+    Agent,
+    Password,
+    PublicKey,
+}
+
+impl AuthKind {
+    const ALL: [AuthKind; 3] = [AuthKind::Agent, AuthKind::Password, AuthKind::PublicKey];
+
+    fn label(self) -> &'static str {
+        match self {
+            AuthKind::Agent => "Agent",
+            AuthKind::Password => "Password",
+            AuthKind::PublicKey => "Public key",
+        }
+    }
+}
+
 /// Messages emitted by the sidebar. The parent maps these into its own
 /// top-level message type and decides how to act on them (e.g. persisting
 /// via a `HostStore`).
@@ -18,6 +42,8 @@ pub enum SidebarMessage {
     NameInputChanged(String),
     AddressInputChanged(String),
     UsernameInputChanged(String),
+    AuthKindSelected(AuthKind),
+    KeyPathInputChanged(String),
     AddHost,
     DeleteHost(HostId),
     SelectHost(HostId),
@@ -30,6 +56,8 @@ pub struct SidebarState {
     pub name_input: String,
     pub address_input: String,
     pub username_input: String,
+    pub auth_kind: AuthKind,
+    pub key_path_input: String,
 }
 
 /// Renders the sidebar: a scrollable host list above a compact "add host"
@@ -39,7 +67,17 @@ pub fn view<'a>(hosts: &'a [HostProfile], state: &'a SidebarState) -> Element<'a
         .iter()
         .fold(column![].spacing(4), |col, host| col.push(host_row(host)));
 
-    let form = column![
+    let auth_picker = AuthKind::ALL.iter().fold(row![].spacing(4), |row, &kind| {
+        let label = text(kind.label()).size(12);
+        let picker = if kind == state.auth_kind {
+            button(label.color(colours::TEXT)).style(button::primary)
+        } else {
+            button(label.color(colours::TEXT_MUTED)).style(button::secondary)
+        };
+        row.push(picker.on_press(SidebarMessage::AuthKindSelected(kind)))
+    });
+
+    let mut form = column![
         text_input("Name", &state.name_input)
             .on_input(SidebarMessage::NameInputChanged)
             .size(13),
@@ -49,10 +87,20 @@ pub fn view<'a>(hosts: &'a [HostProfile], state: &'a SidebarState) -> Element<'a
         text_input("username", &state.username_input)
             .on_input(SidebarMessage::UsernameInputChanged)
             .size(13),
-        button(text("Add host").size(13)).on_press(SidebarMessage::AddHost),
+        auth_picker,
     ]
     .spacing(6)
     .padding(8);
+
+    if state.auth_kind == AuthKind::PublicKey {
+        form = form.push(
+            text_input("~/.ssh/id_ed25519", &state.key_path_input)
+                .on_input(SidebarMessage::KeyPathInputChanged)
+                .size(13),
+        );
+    }
+
+    form = form.push(button(text("Add host").size(13)).on_press(SidebarMessage::AddHost));
 
     container(
         column![

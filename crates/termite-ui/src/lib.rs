@@ -5,8 +5,10 @@
 //! (TabBar, SidebarPanel, TerminalView, CommandPalette, HostCard, etc.).
 //! Widgets are added incrementally as milestones are implemented.
 
+pub mod prompt;
 pub mod sidebar;
 pub mod theme;
 
-pub use sidebar::{SidebarMessage, SidebarState};
+pub use prompt::{Prompt, PromptMessage};
+pub use sidebar::{AuthKind, SidebarMessage, SidebarState};
 pub use theme::TermiteTheme;
