@@ -66,6 +66,7 @@ pub struct TermiteApp {
 /// SSH-type-free display data `termite_ui::prompt::view` renders — embedded
 /// directly (rather than derived on each `view()` call) so the modal's
 /// `Element` can borrow it with `app`'s lifetime instead of a temporary's.
+#[derive(Debug)]
 enum PendingPrompt {
     Credential {
         session: SessionId,
@@ -479,6 +480,20 @@ fn update_prompt(app: &mut TermiteApp, message: PromptMessage) {
     }
 }
 
+/// Builds the `AuthMethod` a new host profile should be saved with from the
+/// add-host form's selection. `key_path` is only consulted for `PublicKey`;
+/// the caller (`update_sidebar`) already rejects an empty one before this
+/// runs, so it isn't validated again here.
+fn auth_method_from_form(kind: AuthKind, key_path: String) -> AuthMethod {
+    match kind {
+        AuthKind::Agent => AuthMethod::Agent,
+        AuthKind::Password => AuthMethod::Password,
+        AuthKind::PublicKey => AuthMethod::PublicKey {
+            key_path: key_path.into(),
+        },
+    }
+}
+
 fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message> {
     match message {
         SidebarMessage::NameInputChanged(value) => {
@@ -511,13 +526,10 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                     std::mem::take(&mut app.sidebar.address_input),
                     std::mem::take(&mut app.sidebar.username_input),
                 );
-                profile.auth = match app.sidebar.auth_kind {
-                    AuthKind::Agent => AuthMethod::Agent,
-                    AuthKind::Password => AuthMethod::Password,
-                    AuthKind::PublicKey => AuthMethod::PublicKey {
-                        key_path: std::mem::take(&mut app.sidebar.key_path_input).into(),
-                    },
-                };
+                profile.auth = auth_method_from_form(
+                    app.sidebar.auth_kind,
+                    std::mem::take(&mut app.sidebar.key_path_input),
+                );
                 app.sidebar.auth_kind = AuthKind::default();
                 let store = Arc::clone(&app.host_store);
                 return Task::perform(
@@ -631,4 +643,370 @@ fn init_tracing() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("termite=info")),
         )
         .init();
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// No live SSH server or GUI is available in this environment (see
+// `HANDOFF.md`'s "Verification limits"/"Isolated GUI testing" notes), so
+// these exercise the prompt state machine directly — `handle_session_event`,
+// `update_prompt`, and `auth_method_from_form` — against a real `TermiteApp`
+// but with a fake `ssh_worker` channel standing in for the subscription, so
+// exactly what `SshWorkerInput` a handler sends can be asserted without a
+// real `SshSession` or Iced runtime.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+    use std::path::PathBuf;
+    use termite_ssh::DisconnectReason;
+
+    fn test_app() -> TermiteApp {
+        TermiteApp::new().expect("failed to spawn local shell pty for test")
+    }
+
+    fn wire_fake_worker(app: &mut TermiteApp) -> bridge::Receiver<SshWorkerInput> {
+        let (tx, rx) = bridge::channel(8);
+        app.ssh_worker = Some(tx);
+        rx
+    }
+
+    fn test_host_key() -> HostKey {
+        HostKey {
+            algorithm: "ssh-ed25519".to_string(),
+            fingerprint: "SHA256:xyz".to_string(),
+        }
+    }
+
+    #[test]
+    fn auth_required_password_opens_credential_prompt() {
+        let mut app = test_app();
+        let id = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(AuthChallenge::Password),
+        );
+
+        match &app.pending_prompt {
+            Some(PendingPrompt::Credential {
+                session,
+                challenge,
+                ui: Prompt::Credential { label, input },
+            }) => {
+                assert_eq!(*session, id);
+                assert_eq!(*challenge, AuthChallenge::Password);
+                assert!(label.contains("Password"));
+                assert!(input.is_empty());
+            }
+            other => panic!("expected a credential prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_required_passphrase_label_includes_fingerprint() {
+        let mut app = test_app();
+        let id = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(AuthChallenge::Passphrase {
+                fingerprint: "SHA256:abc".to_string(),
+            }),
+        );
+
+        match &app.pending_prompt {
+            Some(PendingPrompt::Credential {
+                ui: Prompt::Credential { label, .. },
+                ..
+            }) => assert!(label.contains("SHA256:abc")),
+            other => panic!("expected a credential prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_key_unknown_opens_prompt_without_warning() {
+        let mut app = test_app();
+        let id = SessionId::new();
+        let key = test_host_key();
+
+        handle_session_event(&mut app, id, SessionEvent::HostKeyUnknown(key.clone()));
+
+        match &app.pending_prompt {
+            Some(PendingPrompt::HostKey {
+                session,
+                ui:
+                    Prompt::HostKey {
+                        algorithm,
+                        fingerprint,
+                        warning,
+                        ..
+                    },
+            }) => {
+                assert_eq!(*session, id);
+                assert_eq!(algorithm, &key.algorithm);
+                assert_eq!(fingerprint, &key.fingerprint);
+                assert!(!warning);
+            }
+            other => panic!("expected a host-key prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_key_mismatch_opens_prompt_with_warning() {
+        let mut app = test_app();
+        let id = SessionId::new();
+
+        handle_session_event(&mut app, id, SessionEvent::HostKeyMismatch(test_host_key()));
+
+        match &app.pending_prompt {
+            Some(PendingPrompt::HostKey {
+                ui: Prompt::HostKey { warning, .. },
+                ..
+            }) => assert!(*warning),
+            other => panic!("expected a host-key prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_auth_required_fails_closed_and_leaves_first_prompt_intact() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let first = SessionId::new();
+        let second = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            first,
+            SessionEvent::AuthRequired(AuthChallenge::Password),
+        );
+        handle_session_event(
+            &mut app,
+            second,
+            SessionEvent::AuthRequired(AuthChallenge::Password),
+        );
+
+        match &app.pending_prompt {
+            Some(PendingPrompt::Credential { session, .. }) => assert_eq!(*session, first),
+            other => panic!("expected the first prompt to survive, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(id, SessionCommand::Disconnect)) => {
+                assert_eq!(id, second)
+            }
+            other => panic!("expected a Disconnect for the second session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_host_key_event_fails_closed_and_rejects() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let first = SessionId::new();
+        let second = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            first,
+            SessionEvent::HostKeyUnknown(test_host_key()),
+        );
+        handle_session_event(
+            &mut app,
+            second,
+            SessionEvent::HostKeyUnknown(test_host_key()),
+        );
+
+        match &app.pending_prompt {
+            Some(PendingPrompt::HostKey { session, .. }) => assert_eq!(*session, first),
+            other => panic!("expected the first prompt to survive, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(id, SessionCommand::ApproveHostKey(false))) => {
+                assert_eq!(id, second)
+            }
+            other => panic!("expected a rejection for the second session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_sends_password_auth_response_and_clears_prompt() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(AuthChallenge::Password),
+        );
+        update_prompt(&mut app, PromptMessage::InputChanged("hunter2".to_string()));
+        update_prompt(&mut app, PromptMessage::Submit);
+
+        assert!(app.pending_prompt.is_none());
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(
+                sent_id,
+                SessionCommand::AuthResponse(AuthResponse::Password(secret)),
+            )) => {
+                assert_eq!(sent_id, id);
+                assert_eq!(secret.expose_secret(), "hunter2");
+            }
+            other => panic!("expected a password AuthResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_passphrase_sends_passphrase_auth_response() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(AuthChallenge::Passphrase {
+                fingerprint: "SHA256:abc".to_string(),
+            }),
+        );
+        update_prompt(
+            &mut app,
+            PromptMessage::InputChanged("swordfish".to_string()),
+        );
+        update_prompt(&mut app, PromptMessage::Submit);
+
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(
+                _,
+                SessionCommand::AuthResponse(AuthResponse::Passphrase(secret)),
+            )) => {
+                assert_eq!(secret.expose_secret(), "swordfish");
+            }
+            other => panic!("expected a passphrase AuthResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_disconnects_and_clears_prompt() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(AuthChallenge::Password),
+        );
+        update_prompt(&mut app, PromptMessage::Cancel);
+
+        assert!(app.pending_prompt.is_none());
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(sent_id, SessionCommand::Disconnect)) => {
+                assert_eq!(sent_id, id)
+            }
+            other => panic!("expected a Disconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approve_sends_approve_host_key_true() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+
+        handle_session_event(&mut app, id, SessionEvent::HostKeyUnknown(test_host_key()));
+        update_prompt(&mut app, PromptMessage::Approve);
+
+        assert!(app.pending_prompt.is_none());
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(sent_id, SessionCommand::ApproveHostKey(true))) => {
+                assert_eq!(sent_id, id)
+            }
+            other => panic!("expected an ApproveHostKey(true), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_sends_approve_host_key_false() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let id = SessionId::new();
+
+        handle_session_event(&mut app, id, SessionEvent::HostKeyMismatch(test_host_key()));
+        update_prompt(&mut app, PromptMessage::Reject);
+
+        assert!(app.pending_prompt.is_none());
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(sent_id, SessionCommand::ApproveHostKey(false))) => {
+                assert_eq!(sent_id, id)
+            }
+            other => panic!("expected an ApproveHostKey(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disconnect_clears_prompt_for_its_own_session() {
+        let mut app = test_app();
+        let id = SessionId::new();
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::AuthRequired(AuthChallenge::Password),
+        );
+        assert!(app.pending_prompt.is_some());
+
+        handle_session_event(
+            &mut app,
+            id,
+            SessionEvent::Disconnected {
+                reason: DisconnectReason::Remote,
+            },
+        );
+
+        assert!(app.pending_prompt.is_none());
+    }
+
+    #[test]
+    fn disconnect_of_a_different_session_leaves_prompt_intact() {
+        let mut app = test_app();
+        let prompting = SessionId::new();
+        let other = SessionId::new();
+        handle_session_event(
+            &mut app,
+            prompting,
+            SessionEvent::AuthRequired(AuthChallenge::Password),
+        );
+
+        handle_session_event(
+            &mut app,
+            other,
+            SessionEvent::Disconnected {
+                reason: DisconnectReason::Remote,
+            },
+        );
+
+        assert!(app.pending_prompt.is_some());
+    }
+
+    #[test]
+    fn auth_method_from_form_maps_each_kind() {
+        assert_eq!(
+            auth_method_from_form(AuthKind::Agent, String::new()),
+            AuthMethod::Agent
+        );
+        assert_eq!(
+            auth_method_from_form(AuthKind::Password, String::new()),
+            AuthMethod::Password
+        );
+        assert_eq!(
+            auth_method_from_form(
+                AuthKind::PublicKey,
+                "/home/user/.ssh/id_ed25519".to_string()
+            ),
+            AuthMethod::PublicKey {
+                key_path: PathBuf::from("/home/user/.ssh/id_ed25519"),
+            },
+        );
+    }
 }
