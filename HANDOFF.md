@@ -1,6 +1,19 @@
-# Termite — Conversation Handoff (v6)
+# Termite — Conversation Handoff (v7)
 
-This document gives the next conversation full context to continue development without losing anything. It supersedes v5. **Read this one — it records the protocol-level work of M3 as complete (agent auth, RSA hash handling, `ssh_config` parsing all landed and verified).**
+This document gives the next conversation full context to continue development without losing anything. It supersedes v6. **Read this one — CI is now actually green on GitHub (not just locally); M3's protocol layer remains complete and is the last milestone-level state that changed.**
+
+---
+
+## What happened since v6 (2026-07-14)
+
+v6 claimed `12b8518` ("fix(ci): unbreak audit/deny/Linux-test jobs") fixed CI but had never actually been watched against a real run — it hadn't. It had in fact already been pushed (v6 was wrong that push was still outstanding) and the real run showed only the `Security Audit` job failing, for two independent reasons fixed in two follow-up commits:
+
+1. **`RUSTSEC-2023-0071` not ignored in CI** (`298b50d`). `rustsec/audit-check@v2` does not read `.cargo/audit.toml` the way the `cargo-audit` CLI does — its ignore list is a separate `ignore:` action input. Without it, the deliberately-unfixed RSA advisory (see `.cargo/audit.toml`/`deny.toml`) failed the job even though `cargo deny` and local `cargo audit` both passed. Fixed by passing `ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0194,RUSTSEC-2026-0195` on the step.
+2. **Missing `checks: write` permission** (`49c59ea`). After (1), the underlying audit itself passed clean, but the action still failed with `403 Resource not accessible by integration` when it tried to publish results via the Checks API — this repo's default `GITHUB_TOKEN` is read-only and the workflow had no `permissions:` block at all. Fixed by scoping `contents: read` + `checks: write` to the `audit` job.
+
+Verified against the real run (not just locally): `https://github.com/brass-ape/termite/actions/runs/29308863652` — all six jobs (Lint, Test × 3 OS, Cargo Deny, Security Audit) green on `49c59ea`.
+
+**Lesson for future CI changes to this repo**: GitHub Actions that wrap a CLI tool (audit-check wrapping cargo-audit) don't necessarily inherit that CLI's config-file conventions, and don't necessarily inherit sensible default token permissions either. A commit message claiming something is "verified" for a GitHub Action is not evidence until a real workflow run has been checked via the API or `gh run list/view` (not installed in this environment — used raw `curl` against the public REST API instead, which works unauthenticated for public repos except log downloads, which need admin/token auth).
 
 ---
 
@@ -31,9 +44,9 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 ## Repo state
 
 - **Location:** `~/Documents/code/termite`
-- **Git:** `main`, clean. Everything is committed through `16271c7` (ssh_config parser + `SshError::ConfigParse`). **Still never pushed since the deny.toml/audit fixes (`94a2fba`)** — the GitHub actions (`rustsec/audit-check`, `cargo-deny-action`) haven't run against the migrated config; push when the user wants CI to run and watch that first run.
-- Verify with `git status` / `git show --stat` rather than trusting this document or commit messages blindly — commits `7a39679`/`906634e` are the standing example of why.
-- Environment: Arch, Hyprland/Wayland, Rust 1.97, repo-local git identity, `cargo-audit`/`cargo-deny` binaries in `~/.local/bin`.
+- **Git:** `main`, clean, pushed and up to date with `origin/main` at `49c59ea`. CI is green on GitHub (verified via the Actions API, not just assumed).
+- Verify with `git status` / `git show --stat` rather than trusting this document or commit messages blindly — commits `7a39679`/`906634e` are the standing example of why, and `12b8518`'s "unbreak CI" claim (see above) is the same lesson applied to CI status specifically: don't trust "should work" for a GitHub Actions change, check the actual run.
+- Environment: Arch, Hyprland/Wayland, Rust 1.97, repo-local git identity, `cargo-audit`/`cargo-deny` binaries in `~/.local/bin`. No `gh` CLI installed — checked Actions status via unauthenticated `curl` against `api.github.com/repos/brass-ape/termite/actions/runs` (works for run/job status on this public repo; job log downloads 403 without admin token).
 
 ---
 
@@ -69,9 +82,8 @@ Security invariants: unchanged from CLAUDE.md, all honored — secrets in `secre
 
 ## Suggested next steps
 
-1. **Push and watch CI** — still outstanding from v5. The migrated `deny.toml` + `.cargo/audit.toml` have never met the real GitHub actions.
-2. **Start M4 (host management UI)** — M3's protocol surface is complete and M4 is the first consumer of all of it: `SessionEvent`/`SessionCommand` wiring into Iced, host profiles from `termite-storage`, `SshConfig` alias resolution, passphrase prompt dialog, key-gen UI.
+1. **Start M4 (host management UI)** — CI is settled and M3's protocol surface is complete; M4 is the first consumer of all of it: `SessionEvent`/`SessionCommand` wiring into Iced, host profiles from `termite-storage`, `SshConfig` alias resolution, passphrase prompt dialog, key-gen UI. This is now the only pending item.
 
 ---
 
-*Handoff v6 written after landing the last M3 protocol item (`ssh_config` parsing); RSA hash threading and agent auth landed between v5 and v6. Working agreement: commit actively as work lands (the user asked for this explicitly).*
+*Handoff v7 written after actually verifying CI goes green on GitHub (two real bugs in the audit-check step, both fixed and confirmed against a live run). v6 had claimed this was done and pushed; neither was true yet. Working agreement: commit actively as work lands (the user asked for this explicitly); push only when asked.*
