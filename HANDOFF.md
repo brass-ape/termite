@@ -1,10 +1,26 @@
-# Termite — Conversation Handoff (v8)
+# Termite — Conversation Handoff (v9)
 
-This document gives the next conversation full context to continue development without losing anything. It supersedes v7. **Read this one — M4 (host management) is now underway: host profiles persist, the sidebar renders and edits them, and selecting a host actually opens a real SSH session. Three commits are local-only, not yet pushed (see Repo state).**
+This document gives the next conversation full context to continue development without losing anything. It supersedes v8. **Read this one — M4's three previously-deferred UI items (auth-method picker, credential prompt, host-key approval) are now done: password/public-key host profiles and first-contact hosts are reachable end-to-end from the UI. `9dac4ee`/`970e428`/`c35fd44` (v8's local-only commits) are now pushed; this session's work is local-only in turn (see Repo state).**
 
 ---
 
-## What happened since v7 (2026-07-14, same day)
+## What happened since v8 (2026-07-14, same day — third session)
+
+Closed out the gap v8 flagged as the natural next M4 slice: `SessionEvent::AuthRequired`/`HostKeyUnknown`/`HostKeyMismatch` previously failed closed with no UI (disconnect / reject unconditionally). All three now open a real modal:
+
+1. **Auth-method picker** (`crates/termite-ui/src/sidebar.rs`). The add-host form gained an Agent/Password/Public-key button row (`AuthKind`, a UI-local enum — kept separate from `termite_core::AuthMethod` because the form needs a selectable "public key" state before a path has been typed in, which `AuthMethod::PublicKey`'s mandatory `PathBuf` can't represent) and a conditional key-path text field shown only when Public key is selected. `termite-app`'s `update_sidebar` builds the real `AuthMethod` from `(auth_kind, key_path_input)` on submit; a public-key profile with an empty path is rejected client-side rather than saved (would be unfixable short of delete-and-re-add).
+2. **Credential + host-key modal** (new `crates/termite-ui/src/prompt.rs`). One pure-presentation module covers both: `Prompt::Credential { label, input }` (a masked `text_input`, Submit/Cancel) and `Prompt::HostKey { label, algorithm, fingerprint, warning }` (Reject/"Trust & continue", red title when `warning` is set for a *changed* key vs. a first-contact one). Deliberately takes only plain strings/bools — never `termite_ssh::{AuthChallenge, HostKey}` — keeping `termite-ui` free of SSH knowledge per `CLAUDE.md`'s crate boundaries. Rendered as a dimmed full-screen overlay via `iced::widget::Stack` in `termite-app`'s `view()`.
+3. **Wiring** (`crates/termite-app/src/lib.rs`). New `TermiteApp::pending_prompt: Option<PendingPrompt>`, an app-local enum (`Credential { session, challenge, ui: Prompt }` / `HostKey { session, ui: Prompt }`) that embeds the `Prompt` UI data directly rather than deriving it fresh in `view()` — needed because `prompt::view()`'s returned `Element` borrows its input, and a value derived fresh each frame would be a dangling temporary; embedding it in state owned by `app` gives the borrow `app`'s lifetime instead (`E0515` if you try the derive-on-render approach — hit and fixed this session). `handle_session_event` opens the modal on `AuthRequired`/`HostKeyUnknown`/`HostKeyMismatch`; `update_prompt` answers it (`Submit` → wraps the input in `secrecy::SecretString` and sends `SessionCommand::AuthResponse`; `Approve`/`Reject` → `SessionCommand::ApproveHostKey`). Still fails closed, now scoped correctly: only one prompt is shown at a time — a second one arriving while the modal is already open disconnects/rejects rather than silently overwriting the pending decision. A prompt tied to a session that disconnects out from under it (e.g. the user answered a *different* stale prompt) is cleared automatically rather than left dangling.
+
+**Not done / explicitly out of scope this session**: no "save to keychain" toggle on the credential prompt — submitted passwords/passphrases go straight to `SessionCommand::AuthResponse` and are not persisted via `CredentialStore`, so they'll be asked for again next connection. This was already called out as a separate, optional M3/M4 item in v8 and earlier; still true.
+
+**Verification**: `cargo test --workspace` (24 tests) green, `clippy --all-targets -D warnings` clean, `fmt --check` clean, and a rendering smoke test in the isolated Xvfb `:99` display (see below) confirmed the auth-method picker draws correctly with Agent pre-selected. The modal itself (credential/host-key prompt) was not click-tested — see "Isolated GUI testing"'s standing limitation that only rendering, not interaction, can be verified this way; no live SSH server was available to actually trigger `AuthRequired`/`HostKeyUnknown` and drive the modal open.
+
+One design note worth keeping for later sessions: `iced::keyboard::on_key_press` (used to route keystrokes to the active SSH session / local PTY) only fires for events the widget tree left `Status::Ignored` — a focused `text_input` marks the event `Captured` first, so typing into the sidebar's fields or this new credential prompt does **not** leak keystrokes to the terminal underneath. Checked `iced_futures-0.13.2/src/keyboard.rs` directly to confirm this isn't a latent bug, since the global-subscription-plus-text-inputs combination looked suspicious at a glance.
+
+---
+
+## What happened since v7 (2026-07-14, same day — second session)
 
 M4 work started, in dependency order per `ARCHITECTURE.md`'s checklist (host profile CRUD → sidebar → session wiring):
 
@@ -60,7 +76,7 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 ## Repo state
 
 - **Location:** `~/Documents/code/termite`
-- **Git:** `main`, working tree clean, but **3 commits ahead of `origin/main`** (`9dac4ee`, `970e428`, `c35fd44` — HostStore, a CLAUDE.md doc sync, and SSH session wiring). Not pushed: working agreement is commit actively, push only when asked, and no push has been asked for since `7a459b7`/`49c59ea`. Don't assume these are on GitHub — CI has not run against them.
+- **Git:** `main`. `9dac4ee`/`970e428`/`c35fd44` (v8's local-only commits) are confirmed pushed — `origin/main` matched `HEAD` at the start of this session. This session added `479f05a` (auth-method picker + prompt modal), local-only so far, plus this HANDOFF update on top. Working agreement: commit actively, push only when asked — no push has been asked for since `49c59ea`. Don't assume local-only commits are on GitHub — CI has not run against them.
 - Verify with `git status` / `git show --stat` rather than trusting this document or commit messages blindly — commits `7a39679`/`906634e` are the standing example of why, and `12b8518`'s "unbreak CI" claim (see v7 section below) is the same lesson applied to CI status specifically: don't trust "should work" for a GitHub Actions change, check the actual run.
 - Environment: Arch, Hyprland/Wayland, Rust 1.97, repo-local git identity, `cargo-audit`/`cargo-deny` binaries in `~/.local/bin`. No `gh` CLI installed — checked Actions status via unauthenticated `curl` against `api.github.com/repos/brass-ape/termite/actions/runs` (works for run/job status on this public repo; job log downloads 403 without admin token).
 
@@ -73,8 +89,8 @@ Full design rationale is in `ARCHITECTURE.md`. Read that first. Also read `CLAUD
 | **M0** | ✅ Done | Workspace scaffold, CI, window opens |
 | **M1** | ✅ Done | Local terminal emulator (PTY + VT + Iced rendering) — verified end-to-end |
 | **M2** | ✅ Done | SSH core (password auth, mandatory known_hosts verification) — hermetic integration test |
-| **M3** | 🟢 Protocol layer done | Key auth + credential storage. Done: ed25519 generate/load/encrypt/decrypt, RSA loading + correct `rsa-sha2-*` hash selection, passphrase decryption + prompt event flow, `KeyProvider`/`LocalKeyProvider`, publickey auth end-to-end, SSH agent auth, `CredentialStore` on the OS keychain, `~/.ssh/config` parsing. **Remaining are UI-facing items that land with M4+**: passphrase prompt dialog, key-gen UI, optional passphrase/password save toggles. ECDSA loading is not enabled (ssh-key `p256` feature undeclared) — deliberate cut unless a user needs it; ed25519/RSA cover the field |
-| M4 | 🟡 In progress | Host management UI. Done: `HostStore` persistence, sidebar list/add/delete, `SessionEvent`/`SessionCommand` wiring (session actually connects on select). Remaining: auth-method picker in the add-host form, passphrase/password prompt dialog, host-key-approval dialog (all three needed before non-agent auth or first-contact hosts work end-to-end), `SshConfig` alias resolution, key-gen UI |
+| **M3** | 🟢 Protocol layer done | Key auth + credential storage. Done: ed25519 generate/load/encrypt/decrypt, RSA loading + correct `rsa-sha2-*` hash selection, passphrase decryption + prompt event flow, `KeyProvider`/`LocalKeyProvider`, publickey auth end-to-end, SSH agent auth, `CredentialStore` on the OS keychain, `~/.ssh/config` parsing, passphrase/password prompt dialog (landed this session as part of M4's modal — see below). **Remaining are UI-facing items that land with M4+**: key-gen UI, optional passphrase/password save toggles (submitted credentials aren't offered to the keychain yet). ECDSA loading is not enabled (ssh-key `p256` feature undeclared) — deliberate cut unless a user needs it; ed25519/RSA cover the field |
+| M4 | 🟡 In progress | Host management UI. Done: `HostStore` persistence, sidebar list/add/delete, `SessionEvent`/`SessionCommand` wiring, auth-method picker in the add-host form, credential prompt modal, host-key-approval modal — password/public-key profiles and first-contact hosts are now reachable end-to-end from the UI. Remaining: `SshConfig` alias resolution (parser exists, nothing calls it yet), key-gen UI, "save credential to keychain" toggle on the prompt modal |
 | M5–M9 | Pending | Tabs, advanced terminal, forwarding/SFTP/ProxyJump, palette, release |
 
 ---
@@ -85,8 +101,9 @@ Workspace: `termite` binary + `crates/{termite-core,-ssh,-terminal,-storage,-cry
 
 M4 files so far, all verified:
 - `crates/termite-storage/src/host_store.rs` — `HostStore` trait, `TomlHostStore`, `MemoryHostStore`.
-- `crates/termite-ui/src/sidebar.rs` — `sidebar::view()`, `SidebarMessage`, `SidebarState`. Pure presentation, no `HostStore`/SSH knowledge.
-- `crates/termite-app/src/lib.rs` — `TermiteApp` now holds `host_store`, `hosts`, `sidebar`, `ssh_worker: Option<Sender<SshWorkerInput>>`, `active_session: Option<SessionId>`. The `ssh_worker` free fn is the persistent subscription described above; `handle_session_event` is where `SessionEvent`s land.
+- `crates/termite-ui/src/sidebar.rs` — `sidebar::view()`, `SidebarMessage`, `SidebarState`, `AuthKind` (the add-host form's Agent/Password/Public-key picker). Pure presentation, no `HostStore`/SSH knowledge.
+- `crates/termite-ui/src/prompt.rs` — `prompt::view()`, `Prompt` (`Credential`/`HostKey` variants), `PromptMessage`. Pure presentation, only ever sees plain display strings — no `termite_ssh` types.
+- `crates/termite-app/src/lib.rs` — `TermiteApp` now holds `host_store`, `hosts`, `sidebar`, `ssh_worker: Option<Sender<SshWorkerInput>>`, `active_session: Option<SessionId>`, `pending_prompt: Option<PendingPrompt>`. The `ssh_worker` free fn is the persistent subscription described above; `handle_session_event` is where `SessionEvent`s land, `update_prompt` is where the modal's answer is turned into a `SessionCommand`.
 
 M3 files, all verified:
 - `crates/termite-core/src/traits.rs` — `KeyProvider` (`public_key_blob()`, `sign(data, hash_alg)`), `CredentialStore`.
@@ -103,9 +120,11 @@ Security invariants: unchanged from CLAUDE.md, all honored — secrets in `secre
 
 ## Suggested next steps
 
-1. **Auth-method picker + prompt dialogs** — the sidebar's add-host form only ever creates `AuthMethod::Agent` profiles, and `AuthRequired`/`HostKeyUnknown`/`HostKeyMismatch` currently fail closed with no UI (see above). Needed together: a way to pick Password/PublicKey/Agent when adding a host, a passphrase/password prompt dialog wired to `AuthResponse`, and a host-key-approval dialog wired to `ApproveHostKey` — otherwise nothing but agent auth against already-trusted hosts is reachable from the UI.
-2. **Decide whether to push** the 3 local-only commits (`9dac4ee`, `970e428`, `c35fd44`) — nothing has asked for a push since `49c59ea`.
+1. **End-to-end verification against a real server** — nothing in this project has yet exercised `AuthRequired`/`HostKeyUnknown`/`HostKeyMismatch` against a live `sshd` and clicked through the resulting modal; only rendering has been checked (Xvfb screenshot, no live SSH server available, and `ydotool` is off-limits for driving clicks — see "Isolated GUI testing"). If a throwaway SSH server or container ever becomes available in this environment, this is the highest-value thing to verify next.
+2. **"Save to keychain" toggle on the credential prompt** — passwords/passphrases typed into the new modal are used once and forgotten; wiring `Submit` to also offer saving via `CredentialStore` (already exists, unused by this modal) removes the "type it every time" friction for password/publickey hosts.
+3. **`SshConfig` alias resolution** — the `~/.ssh/config` parser from M3 (`crates/termite-ssh/src/ssh_config.rs`) still has no caller; the natural hook is resolving an alias when the add-host form's address field is typed.
+4. **Decide whether to push** this session's local-only commit(s) — see Repo state.
 
 ---
 
-*Handoff v8 written after wiring real `SessionEvent`/`SessionCommand` handling into `termite-app` on top of the HostStore/sidebar work from earlier the same day. v7's CI-fix content is kept below for history. Working agreement: commit actively as work lands (the user asked for this explicitly); push only when asked.*
+*Handoff v9 written after adding the auth-method picker and the credential/host-key prompt modal — the three items v8 flagged as the natural next M4 slice. v8's session-wiring content is kept above for history (now itself pushed). Working agreement: commit actively as work lands (the user asked for this explicitly); push only when asked.*
