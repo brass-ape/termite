@@ -209,6 +209,31 @@ impl SshConfig {
 
         resolved
     }
+
+    /// Literal `Host` aliases defined in the config: patterns with no glob
+    /// characters (`*`/`?`) and not negated, in file order, deduplicated.
+    /// Used by the host-import feature — only concrete aliases make sense
+    /// as import candidates, unlike a wildcard block such as `Host *.corp`
+    /// which doesn't name a single host to import.
+    ///
+    /// Aliases come back lowercased: the parser only retains the lowercased
+    /// form of each pattern (matching in [`Self::query`] is case-
+    /// insensitive), so original casing from the file isn't preserved.
+    pub fn host_aliases(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut aliases = Vec::new();
+        for block in &self.blocks {
+            for pattern in &block.patterns {
+                if pattern.negated || pattern.pattern.contains(['*', '?']) {
+                    continue;
+                }
+                if seen.insert(pattern.pattern.clone()) {
+                    aliases.push(pattern.pattern.clone());
+                }
+            }
+        }
+        aliases
+    }
 }
 
 /// Appends to the most recent block. `parse` seeds `blocks` with the global
@@ -461,5 +486,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = SshConfig::load(&dir.path().join("does-not-exist")).unwrap();
         assert_eq!(config.query("any"), HostConfig::default());
+    }
+
+    #[test]
+    fn host_aliases_lists_literal_patterns_only() {
+        let config = SshConfig::parse(
+            "Host work\n\
+             \tHostName gitlab.internal.example.com\n\
+             Host *.corp\n\
+             \tUser deploy\n\
+             Host !excluded staging\n\
+             \tHostName staging.example.com\n",
+        )
+        .unwrap();
+
+        // `*.corp` is a wildcard (skipped); `!excluded` is a negation
+        // (skipped); `work` and `staging` are literal aliases worth
+        // importing. The global `*` block from the parser's own preamble is
+        // a wildcard too, so it's excluded automatically, not special-cased.
+        assert_eq!(config.host_aliases(), vec!["work", "staging"]);
+    }
+
+    #[test]
+    fn host_aliases_deduplicates_repeated_names() {
+        let config = SshConfig::parse("Host work\n\tPort 22\nHost work\n\tUser deploy\n").unwrap();
+        assert_eq!(config.host_aliases(), vec!["work"]);
     }
 }

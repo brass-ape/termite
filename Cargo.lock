@@ -4962,6 +4962,7 @@ dependencies = [
 name = "termite-app"
 version = "0.1.0"
 dependencies = [
+ "dirs 5.0.1",
  "iced",
  "secrecy",
  "tempfile",

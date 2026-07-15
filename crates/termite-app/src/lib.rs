@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! Top-level application state and Iced wiring for Termite.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iced::futures::channel::mpsc as bridge;
 use iced::futures::{SinkExt, Stream, StreamExt};
@@ -197,6 +198,34 @@ async fn list_hosts(store: Arc<dyn HostStore>) -> Vec<HostProfile> {
     .unwrap_or_default()
 }
 
+/// Orders the sidebar's host list: starred hosts first, then by most recent
+/// connection (never-connected hosts sort last within their tier), ties
+/// broken alphabetically. The sidebar itself renders whatever order it's
+/// given (see its own doc comment) — this is the one place display order is
+/// decided, applied every time `Message::HostsLoaded` delivers a fresh list.
+fn sort_hosts(hosts: &mut [HostProfile]) {
+    hosts.sort_by(|a, b| {
+        b.favourite
+            .cmp(&a.favourite)
+            .then_with(|| b.last_connected.cmp(&a.last_connected))
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+    });
+}
+
+/// Current time as a unix timestamp, for `HostProfile::last_connected`. `0`
+/// on a clock that reports before the epoch — practically never — rather
+/// than propagating an error over a recency-sort nicety.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Requests sent from the app to the persistent SSH worker subscription
 /// (see [`ssh_worker`]).
 #[derive(Debug, Clone)]
@@ -346,7 +375,8 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::HostsLoaded(hosts) => {
+        Message::HostsLoaded(mut hosts) => {
+            sort_hosts(&mut hosts);
             app.hosts = hosts;
         }
         Message::Sidebar(message) => return update_sidebar(app, message),
@@ -620,6 +650,124 @@ fn auth_method_from_form(kind: AuthKind, key_path: String) -> AuthMethod {
     }
 }
 
+/// Splits the form's comma-separated tags field into a `Vec<String>`,
+/// trimming whitespace and dropping empty entries (e.g. a trailing comma).
+fn parse_tags(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Populates the add/edit-host form from an existing profile, in response
+/// to `SidebarMessage::EditHost`. Clears any in-progress key generation
+/// input — it belongs to whatever was being created/edited before, not this
+/// newly-loaded profile.
+fn load_profile_into_form(sidebar: &mut SidebarState, profile: &HostProfile) {
+    sidebar.editing_id = Some(profile.id);
+    sidebar.name_input = profile.name.clone();
+    sidebar.address_input = profile.host.clone();
+    sidebar.username_input = profile.username.clone();
+    sidebar.tags_input = profile.tags.join(", ");
+    sidebar.resolved_port = Some(profile.port);
+    sidebar.resolved_hint = None;
+    sidebar.keygen_comment_input.clear();
+    sidebar.keygen_passphrase_input.clear();
+    match &profile.auth {
+        AuthMethod::Agent => {
+            sidebar.auth_kind = AuthKind::Agent;
+            sidebar.key_path_input.clear();
+        }
+        AuthMethod::Password => {
+            sidebar.auth_kind = AuthKind::Password;
+            sidebar.key_path_input.clear();
+        }
+        AuthMethod::PublicKey { key_path } => {
+            sidebar.auth_kind = AuthKind::PublicKey;
+            sidebar.key_path_input = key_path.display().to_string();
+        }
+    }
+}
+
+/// Builds a `HostProfile` for the host-import feature from one literal
+/// `~/.ssh/config` alias and its resolved settings. `alias` becomes both the
+/// profile's display name and, when the config has no `HostName`, its
+/// connect address too — an alias with no `HostName` just *is* the host to
+/// connect to, per OpenSSH semantics.
+fn host_profile_from_config(alias: &str, resolved: &HostConfig) -> HostProfile {
+    let host = resolved
+        .host_name
+        .clone()
+        .unwrap_or_else(|| alias.to_string());
+    let username = resolved.user.clone().unwrap_or_default();
+    let mut profile = HostProfile::new(alias, host, username);
+    profile.port = resolved.port.unwrap_or(22);
+    profile.auth = match resolved.identity_files.first() {
+        Some(key_path) => AuthMethod::PublicKey {
+            key_path: key_path.clone(),
+        },
+        None => AuthMethod::Agent,
+    };
+    profile
+}
+
+/// Default location offered when the form's key-path field is empty and
+/// "Generate key" is pressed: the app's own config directory rather than
+/// the user's real `~/.ssh` (never touched unless the user explicitly types
+/// a path there), with a numeric suffix appended if the default name is
+/// already taken.
+fn default_keygen_path() -> PathBuf {
+    let base = dirs::config_dir()
+        .map(|dir| dir.join("termite").join("keys"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    first_available_key_path(&base)
+}
+
+/// The suffix-picking logic behind `default_keygen_path`, split out so it's
+/// testable against a tempdir instead of the real config directory.
+fn first_available_key_path(base: &Path) -> PathBuf {
+    let mut candidate = base.join("id_ed25519");
+    let mut suffix = 2;
+    while candidate.exists() {
+        candidate = base.join(format!("id_ed25519_{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+/// Generates a new ed25519 key pair and writes it to `path`. The caller must
+/// have already checked `path` doesn't exist — this never overwrites.
+/// `comment`/`passphrase` apply only if non-empty; a non-empty passphrase is
+/// also saved to the keychain immediately, since the point of generating a
+/// key from this form is for it to be usable right away — unlike an
+/// existing key, nobody has had a chance to type this passphrase into the
+/// credential prompt's own "save to keychain" toggle.
+fn generate_and_save_key(
+    path: &Path,
+    comment: &str,
+    passphrase: &str,
+    credential_store: &Arc<dyn CredentialStore>,
+) -> Result<String, TermiteError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut key = termite_crypto::key::generate_ed25519()?;
+    if !comment.is_empty() {
+        key.set_comment(comment);
+    }
+    let passphrase = (!passphrase.is_empty()).then(|| SecretString::from(passphrase.to_string()));
+    termite_crypto::key::save_to_disk(&key, path, passphrase.as_ref())?;
+    let fingerprint = termite_crypto::key::fingerprint(&key);
+    if let Some(passphrase) = &passphrase {
+        if let Err(err) = credential_store.set_passphrase(&fingerprint, passphrase) {
+            tracing::warn!(%err, "failed to save newly-generated key's passphrase to keychain");
+        }
+    }
+    Ok(fingerprint)
+}
+
 /// Applies a `~/.ssh/config` alias resolution to the add-host form. Only
 /// fills in fields the user hasn't already typed a value into — a later
 /// manual edit always wins over a config default — except the address
@@ -689,43 +837,93 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                 apply_resolved_config(&mut app.sidebar, &resolved);
             }
         }
-        SidebarMessage::AddHost => {
+        SidebarMessage::TagsInputChanged(value) => {
+            app.sidebar.tags_input = value;
+        }
+        SidebarMessage::SearchInputChanged(value) => {
+            app.sidebar.search_input = value;
+        }
+        SidebarMessage::KeygenCommentChanged(value) => {
+            app.sidebar.keygen_comment_input = value;
+        }
+        SidebarMessage::KeygenPassphraseChanged(value) => {
+            app.sidebar.keygen_passphrase_input = value;
+        }
+        SidebarMessage::EditHost(id) => {
+            if let Some(profile) = app.hosts.iter().find(|host| host.id == id).cloned() {
+                load_profile_into_form(&mut app.sidebar, &profile);
+            }
+        }
+        SidebarMessage::CancelEdit => {
+            app.sidebar = SidebarState::default();
+        }
+        SidebarMessage::SaveHost => {
             // A public-key profile with no path would fail to connect with
             // no way to fix it short of deleting and re-adding the host, so
             // it's rejected here rather than saved.
             let key_path_ok = app.sidebar.auth_kind != AuthKind::PublicKey
                 || !app.sidebar.key_path_input.is_empty();
-            if !app.sidebar.name_input.is_empty()
-                && !app.sidebar.address_input.is_empty()
-                && key_path_ok
+            if app.sidebar.name_input.is_empty()
+                || app.sidebar.address_input.is_empty()
+                || !key_path_ok
             {
-                let mut profile = HostProfile::new(
-                    std::mem::take(&mut app.sidebar.name_input),
-                    std::mem::take(&mut app.sidebar.address_input),
-                    std::mem::take(&mut app.sidebar.username_input),
-                );
-                profile.port = app.sidebar.resolved_port.take().unwrap_or(22);
-                profile.auth = auth_method_from_form(
-                    app.sidebar.auth_kind,
-                    std::mem::take(&mut app.sidebar.key_path_input),
-                );
-                app.sidebar.auth_kind = AuthKind::default();
-                app.sidebar.resolved_hint = None;
-                let store = Arc::clone(&app.host_store);
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(err) = store.save(profile) {
-                                tracing::error!(%err, "failed to save host profile");
-                            }
-                            store.list().unwrap_or_default()
-                        })
-                        .await
-                        .unwrap_or_default()
-                    },
-                    Message::HostsLoaded,
-                );
+                return Task::none();
             }
+
+            let tags = parse_tags(&app.sidebar.tags_input);
+            let auth = auth_method_from_form(
+                app.sidebar.auth_kind,
+                std::mem::take(&mut app.sidebar.key_path_input),
+            );
+            let port = app.sidebar.resolved_port.take().unwrap_or(22);
+
+            let profile = match app.sidebar.editing_id {
+                // Preserve id/favourite/last_connected — the form doesn't
+                // surface any of the three, so rebuilding from scratch
+                // would silently unstar or forget the recency of an edited
+                // host.
+                Some(id) => {
+                    let existing = app.hosts.iter().find(|host| host.id == id);
+                    HostProfile {
+                        id,
+                        name: std::mem::take(&mut app.sidebar.name_input),
+                        host: std::mem::take(&mut app.sidebar.address_input),
+                        port,
+                        username: std::mem::take(&mut app.sidebar.username_input),
+                        auth,
+                        tags,
+                        favourite: existing.is_some_and(|host| host.favourite),
+                        last_connected: existing.and_then(|host| host.last_connected),
+                    }
+                }
+                None => {
+                    let mut profile = HostProfile::new(
+                        std::mem::take(&mut app.sidebar.name_input),
+                        std::mem::take(&mut app.sidebar.address_input),
+                        std::mem::take(&mut app.sidebar.username_input),
+                    );
+                    profile.port = port;
+                    profile.auth = auth;
+                    profile.tags = tags;
+                    profile
+                }
+            };
+
+            app.sidebar = SidebarState::default();
+            let store = Arc::clone(&app.host_store);
+            return Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(err) = store.save(profile) {
+                            tracing::error!(%err, "failed to save host profile");
+                        }
+                        store.list().unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
+                },
+                Message::HostsLoaded,
+            );
         }
         SidebarMessage::DeleteHost(id) => {
             if let Some(profile) = app.hosts.iter().find(|host| host.id == id) {
@@ -746,14 +944,127 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                 Message::HostsLoaded,
             );
         }
+        SidebarMessage::ToggleFavourite(id) => {
+            if let Some(mut profile) = app.hosts.iter().find(|host| host.id == id).cloned() {
+                profile.favourite = !profile.favourite;
+                let store = Arc::clone(&app.host_store);
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(err) = store.save(profile) {
+                                tracing::error!(%err, "failed to persist favourite toggle");
+                            }
+                            store.list().unwrap_or_default()
+                        })
+                        .await
+                        .unwrap_or_default()
+                    },
+                    Message::HostsLoaded,
+                );
+            }
+        }
         SidebarMessage::SelectHost(id) => {
-            if let Some(profile) = app.hosts.iter().find(|host| host.id == id).cloned() {
+            if let Some(mut profile) = app.hosts.iter().find(|host| host.id == id).cloned() {
                 match &app.ssh_worker {
                     Some(sender) => {
                         let mut sender = sender.clone();
-                        let _ = sender.try_send(SshWorkerInput::Connect(profile));
+                        let _ = sender.try_send(SshWorkerInput::Connect(profile.clone()));
                     }
                     None => tracing::warn!("ssh worker not ready yet; connect request dropped"),
+                }
+                profile.last_connected = Some(unix_now());
+                let store = Arc::clone(&app.host_store);
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(err) = store.save(profile) {
+                                tracing::error!(%err, "failed to persist last-connected timestamp");
+                            }
+                            store.list().unwrap_or_default()
+                        })
+                        .await
+                        .unwrap_or_default()
+                    },
+                    Message::HostsLoaded,
+                );
+            }
+        }
+        SidebarMessage::ImportFromSshConfig => {
+            let existing_names: HashSet<String> = app
+                .hosts
+                .iter()
+                .map(|host| host.name.to_ascii_lowercase())
+                .collect();
+            let new_profiles: Vec<HostProfile> = app
+                .ssh_config
+                .host_aliases()
+                .into_iter()
+                .filter(|alias| !existing_names.contains(alias))
+                .map(|alias| {
+                    let resolved = app.ssh_config.query(&alias);
+                    host_profile_from_config(&alias, &resolved)
+                })
+                .collect();
+
+            if new_profiles.is_empty() {
+                app.advance(b"\r\n*** no new hosts to import from ~/.ssh/config ***\r\n");
+                return Task::none();
+            }
+
+            let count = new_profiles.len();
+            app.advance(
+                format!("\r\n*** importing {count} host(s) from ~/.ssh/config ***\r\n").as_bytes(),
+            );
+            let store = Arc::clone(&app.host_store);
+            return Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        for profile in new_profiles {
+                            if let Err(err) = store.save(profile) {
+                                tracing::error!(%err, "failed to save imported host profile");
+                            }
+                        }
+                        store.list().unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
+                },
+                Message::HostsLoaded,
+            );
+        }
+        SidebarMessage::GenerateKey => {
+            let path = if app.sidebar.key_path_input.is_empty() {
+                default_keygen_path()
+            } else {
+                PathBuf::from(&app.sidebar.key_path_input)
+            };
+            if path.exists() {
+                app.advance(
+                    format!(
+                        "\r\n*** refusing to generate key: {} already exists ***\r\n",
+                        path.display()
+                    )
+                    .as_bytes(),
+                );
+                return Task::none();
+            }
+            let comment = std::mem::take(&mut app.sidebar.keygen_comment_input);
+            let passphrase = std::mem::take(&mut app.sidebar.keygen_passphrase_input);
+            match generate_and_save_key(&path, &comment, &passphrase, &app.credential_store) {
+                Ok(fingerprint) => {
+                    app.sidebar.key_path_input = path.display().to_string();
+                    app.sidebar.auth_kind = AuthKind::PublicKey;
+                    app.advance(
+                        format!(
+                            "\r\n*** generated ed25519 key {} ({fingerprint}) ***\r\n",
+                            path.display()
+                        )
+                        .as_bytes(),
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(%err, "key generation failed");
+                    app.advance(b"\r\n*** key generation failed; see logs ***\r\n");
                 }
             }
         }
@@ -842,6 +1153,7 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret;
     use std::path::PathBuf;
+    use termite_core::HostId;
     use termite_ssh::DisconnectReason;
     use termite_storage::MemoryStore;
 
@@ -1407,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn add_host_consumes_and_resets_the_resolved_port_and_hint() {
+    fn save_host_resets_the_whole_form() {
         let mut app = test_app();
         app.sidebar.name_input = "Work".to_string();
         app.sidebar.address_input = "gitlab.internal.example.com".to_string();
@@ -1415,10 +1727,11 @@ mod tests {
         app.sidebar.resolved_port = Some(2222);
         app.sidebar.resolved_hint = Some("~/.ssh/config \u{2192} deploy@host:2222".to_string());
 
-        let _ = update_sidebar(&mut app, SidebarMessage::AddHost);
+        let _ = update_sidebar(&mut app, SidebarMessage::SaveHost);
 
         assert_eq!(app.sidebar.resolved_port, None);
         assert_eq!(app.sidebar.resolved_hint, None);
+        assert!(app.sidebar.name_input.is_empty());
     }
 
     #[test]
@@ -1499,5 +1812,294 @@ mod tests {
             .get_password("example.com", "alice")
             .unwrap()
             .is_none());
+    }
+
+    // ── M4 completion: favourites, recent connections, search, tags,
+    // profile editor, ~/.ssh/config import, key generation ─────────────────
+    //
+    // `SaveHost`/`ToggleFavourite`/`SelectHost`/`ImportFromSshConfig` all
+    // persist via `Task::perform(spawn_blocking(...), Message::HostsLoaded)`
+    // — same as the pre-existing `DeleteHost` handler above — and that Task
+    // is never polled by a plain #[test] fn (there's no Iced runtime or
+    // `#[tokio::test]` driving it here). So, consistent with
+    // `delete_host_forgets_its_saved_password` above, these are tested at
+    // the level of what happens *before* the Task is returned (form resets,
+    // ssh_worker sends) and the pure helper functions are tested directly
+    // for the persisted-value logic. `GenerateKey` is the exception: it has
+    // no Task, so it's fully testable end-to-end at the message level.
+
+    #[test]
+    fn sort_hosts_orders_favourites_first_then_recency_then_name() {
+        let mut old_recent = HostProfile::new("Bravo", "b.example.com", "alice");
+        old_recent.last_connected = Some(100);
+        let mut new_recent = HostProfile::new("Alpha", "a.example.com", "alice");
+        new_recent.last_connected = Some(200);
+        let never_connected = HostProfile::new("Zulu", "z.example.com", "alice");
+        let mut favourite = HostProfile::new("Charlie", "c.example.com", "alice");
+        favourite.favourite = true;
+
+        let mut hosts = vec![
+            old_recent.clone(),
+            never_connected.clone(),
+            new_recent.clone(),
+            favourite.clone(),
+        ];
+        sort_hosts(&mut hosts);
+
+        assert_eq!(
+            hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            vec!["Charlie", "Alpha", "Bravo", "Zulu"]
+        );
+    }
+
+    #[test]
+    fn parse_tags_trims_and_drops_empty_entries() {
+        assert_eq!(
+            parse_tags(" prod, db , , staging"),
+            vec!["prod".to_string(), "db".to_string(), "staging".to_string()]
+        );
+        assert_eq!(parse_tags(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn load_profile_into_form_populates_password_auth_fields() {
+        let mut sidebar = SidebarState::default();
+        let profile = HostProfile {
+            port: 2200,
+            tags: vec!["prod".to_string(), "db".to_string()],
+            auth: AuthMethod::Password,
+            ..HostProfile::new("Work", "example.com", "alice")
+        };
+
+        load_profile_into_form(&mut sidebar, &profile);
+
+        assert_eq!(sidebar.editing_id, Some(profile.id));
+        assert_eq!(sidebar.name_input, "Work");
+        assert_eq!(sidebar.address_input, "example.com");
+        assert_eq!(sidebar.username_input, "alice");
+        assert_eq!(sidebar.tags_input, "prod, db");
+        assert_eq!(sidebar.resolved_port, Some(2200));
+        assert_eq!(sidebar.auth_kind, AuthKind::Password);
+        assert!(sidebar.key_path_input.is_empty());
+    }
+
+    #[test]
+    fn load_profile_into_form_switches_to_public_key_and_fills_path() {
+        let mut sidebar = SidebarState::default();
+        let profile = HostProfile {
+            auth: AuthMethod::PublicKey {
+                key_path: PathBuf::from("/keys/id_ed25519"),
+            },
+            ..HostProfile::new("Work", "example.com", "alice")
+        };
+
+        load_profile_into_form(&mut sidebar, &profile);
+
+        assert_eq!(sidebar.auth_kind, AuthKind::PublicKey);
+        assert_eq!(sidebar.key_path_input, "/keys/id_ed25519");
+    }
+
+    #[test]
+    fn host_profile_from_config_uses_alias_as_host_when_no_hostname() {
+        let resolved = HostConfig {
+            user: Some("deploy".to_string()),
+            port: Some(2222),
+            ..HostConfig::default()
+        };
+
+        let profile = host_profile_from_config("work", &resolved);
+
+        assert_eq!(profile.name, "work");
+        assert_eq!(profile.host, "work");
+        assert_eq!(profile.username, "deploy");
+        assert_eq!(profile.port, 2222);
+        assert_eq!(profile.auth, AuthMethod::Agent);
+    }
+
+    #[test]
+    fn host_profile_from_config_prefers_identity_file_over_agent() {
+        let resolved = HostConfig {
+            host_name: Some("gitlab.internal.example.com".to_string()),
+            identity_files: vec![PathBuf::from("/keys/id_ed25519")],
+            ..HostConfig::default()
+        };
+
+        let profile = host_profile_from_config("work", &resolved);
+
+        assert_eq!(profile.host, "gitlab.internal.example.com");
+        assert_eq!(
+            profile.auth,
+            AuthMethod::PublicKey {
+                key_path: PathBuf::from("/keys/id_ed25519")
+            }
+        );
+    }
+
+    #[test]
+    fn first_available_key_path_appends_suffix_when_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            first_available_key_path(dir.path()),
+            dir.path().join("id_ed25519")
+        );
+
+        std::fs::write(dir.path().join("id_ed25519"), b"taken").unwrap();
+        assert_eq!(
+            first_available_key_path(dir.path()),
+            dir.path().join("id_ed25519_2")
+        );
+
+        std::fs::write(dir.path().join("id_ed25519_2"), b"also taken").unwrap();
+        assert_eq!(
+            first_available_key_path(dir.path()),
+            dir.path().join("id_ed25519_3")
+        );
+    }
+
+    #[test]
+    fn generate_and_save_key_without_passphrase_does_not_touch_credential_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+
+        let fingerprint = generate_and_save_key(&path, "", "", &store).unwrap();
+
+        assert!(path.exists());
+        assert!(store.get_passphrase(&fingerprint).unwrap().is_none());
+    }
+
+    #[test]
+    fn generate_and_save_key_with_passphrase_saves_it_by_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+
+        let fingerprint = generate_and_save_key(&path, "work laptop", "hunter2", &store).unwrap();
+
+        let saved = store.get_passphrase(&fingerprint).unwrap().unwrap();
+        assert_eq!(saved.expose_secret(), "hunter2");
+
+        // The comment made it onto the key itself, and the key is
+        // encrypted (a passphrase was given).
+        let loaded = termite_crypto::key::load(&path).unwrap();
+        assert!(loaded.is_encrypted());
+    }
+
+    #[test]
+    fn edit_host_message_loads_profile_into_form() {
+        let mut app = test_app();
+        let profile = HostProfile::new("Work", "example.com", "alice");
+        let id = profile.id;
+        app.hosts.push(profile);
+
+        let _ = update_sidebar(&mut app, SidebarMessage::EditHost(id));
+
+        assert_eq!(app.sidebar.editing_id, Some(id));
+        assert_eq!(app.sidebar.name_input, "Work");
+    }
+
+    #[test]
+    fn cancel_edit_resets_the_form() {
+        let mut app = test_app();
+        app.sidebar.editing_id = Some(HostId::new());
+        app.sidebar.name_input = "Work".to_string();
+
+        let _ = update_sidebar(&mut app, SidebarMessage::CancelEdit);
+
+        assert_eq!(app.sidebar.editing_id, None);
+        assert!(app.sidebar.name_input.is_empty());
+    }
+
+    #[test]
+    fn save_host_is_a_no_op_when_name_is_empty() {
+        let mut app = test_app();
+        app.sidebar.address_input = "example.com".to_string();
+
+        let _ = update_sidebar(&mut app, SidebarMessage::SaveHost);
+
+        // The form is untouched: a real save always clears it.
+        assert_eq!(app.sidebar.address_input, "example.com");
+    }
+
+    #[test]
+    fn select_host_sends_connect_to_the_ssh_worker() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let profile = HostProfile::new("Work", "example.com", "alice");
+        let id = profile.id;
+        app.hosts.push(profile);
+
+        let _ = update_sidebar(&mut app, SidebarMessage::SelectHost(id));
+
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Connect(profile)) => assert_eq!(profile.id, id),
+            other => panic!("expected a Connect for the selected host, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_from_ssh_config_reports_when_there_is_nothing_new() {
+        let mut app = test_app();
+        app.ssh_config = SshConfig::parse("Host work\n\tHostName gitlab.example.com\n").unwrap();
+        app.hosts
+            .push(HostProfile::new("work", "gitlab.example.com", "deploy"));
+
+        let _ = update_sidebar(&mut app, SidebarMessage::ImportFromSshConfig);
+
+        assert!(app
+            .grid
+            .visible_rows()
+            .iter()
+            .any(|row| row.contains("no new hosts")));
+    }
+
+    #[test]
+    fn import_from_ssh_config_reports_progress_for_new_aliases() {
+        let mut app = test_app();
+        app.ssh_config =
+            SshConfig::parse("Host work\n\tHostName gitlab.internal.example.com\n").unwrap();
+
+        let _ = update_sidebar(&mut app, SidebarMessage::ImportFromSshConfig);
+
+        assert!(app
+            .grid
+            .visible_rows()
+            .iter()
+            .any(|row| row.contains("importing 1 host")));
+    }
+
+    #[test]
+    fn generate_key_message_refuses_to_overwrite_an_existing_file() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        std::fs::write(&path, b"already here").unwrap();
+        app.sidebar.key_path_input = path.display().to_string();
+
+        let _ = update_sidebar(&mut app, SidebarMessage::GenerateKey);
+
+        // Refused, so the existing file's contents are untouched and the
+        // key-path field wasn't cleared/replaced by this attempt.
+        assert_eq!(std::fs::read(&path).unwrap(), b"already here");
+        assert!(app
+            .grid
+            .visible_rows()
+            .iter()
+            .any(|row| row.contains("already exists")));
+    }
+
+    #[test]
+    fn generate_key_message_success_fills_key_path_and_switches_auth_kind() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        app.sidebar.key_path_input = path.display().to_string();
+        app.sidebar.auth_kind = AuthKind::Agent;
+
+        let _ = update_sidebar(&mut app, SidebarMessage::GenerateKey);
+
+        assert!(path.exists());
+        assert_eq!(app.sidebar.auth_kind, AuthKind::PublicKey);
+        assert_eq!(app.sidebar.key_path_input, path.display().to_string());
     }
 }
