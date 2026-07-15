@@ -478,6 +478,38 @@ fn save_credential(
     }
 }
 
+/// Removes any keychain entry associated with `profile`'s auth method, so
+/// deleting a host doesn't leave a stale credential behind in the keychain.
+/// Best-effort: a lookup/delete failure (key file already gone, keychain
+/// hiccup) is logged and otherwise ignored — it must never block the host
+/// deletion itself, which is why this isn't threaded through the async
+/// `HostStore::delete` task the caller returns.
+fn forget_credential(store: &Arc<dyn CredentialStore>, profile: &HostProfile) {
+    match &profile.auth {
+        AuthMethod::Agent => {}
+        AuthMethod::Password => {
+            if let Err(err) = store.delete_password(&profile.host, &profile.username) {
+                tracing::warn!(%err, "failed to delete saved password for deleted host");
+            }
+        }
+        AuthMethod::PublicKey { key_path } => match termite_crypto::key::load(key_path) {
+            Ok(key) => {
+                let fingerprint = termite_crypto::key::fingerprint(&key);
+                if let Err(err) = store.delete_passphrase(&fingerprint) {
+                    tracing::warn!(%err, "failed to delete saved passphrase for deleted host");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "failed to load key file to determine passphrase fingerprint; \
+                     any saved passphrase for this host is left in the keychain"
+                );
+            }
+        },
+    }
+}
+
 /// The session a pending prompt (if any) belongs to.
 fn pending_prompt_session(pending: &Option<PendingPrompt>) -> Option<SessionId> {
     match pending {
@@ -696,6 +728,9 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
             }
         }
         SidebarMessage::DeleteHost(id) => {
+            if let Some(profile) = app.hosts.iter().find(|host| host.id == id) {
+                forget_credential(&app.credential_store, profile);
+            }
             let store = Arc::clone(&app.host_store);
             return Task::perform(
                 async move {
@@ -1384,5 +1419,85 @@ mod tests {
 
         assert_eq!(app.sidebar.resolved_port, None);
         assert_eq!(app.sidebar.resolved_hint, None);
+    }
+
+    #[test]
+    fn forget_credential_deletes_a_saved_password() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+        let profile = HostProfile {
+            auth: AuthMethod::Password,
+            ..HostProfile::new("Work", "example.com", "alice")
+        };
+        store
+            .set_password(
+                &profile.host,
+                &profile.username,
+                &SecretString::from("hunter2".to_string()),
+            )
+            .unwrap();
+
+        forget_credential(&store, &profile);
+
+        assert!(store
+            .get_password(&profile.host, &profile.username)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn forget_credential_deletes_a_saved_passphrase_by_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("id_ed25519");
+        let key = termite_crypto::key::generate_ed25519().unwrap();
+        let passphrase = SecretString::from("correct horse battery staple".to_string());
+        termite_crypto::key::save_to_disk(&key, &key_path, Some(&passphrase)).unwrap();
+        let fingerprint = termite_crypto::key::fingerprint(&key);
+
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+        store.set_passphrase(&fingerprint, &passphrase).unwrap();
+
+        let profile = HostProfile {
+            auth: AuthMethod::PublicKey { key_path },
+            ..HostProfile::new("Work", "example.com", "alice")
+        };
+        forget_credential(&store, &profile);
+
+        assert!(store.get_passphrase(&fingerprint).unwrap().is_none());
+    }
+
+    #[test]
+    fn forget_credential_is_a_no_op_for_agent_auth() {
+        // Agent auth never has a keychain entry to begin with; this just
+        // confirms the match arm doesn't panic or touch the store.
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+        let profile = HostProfile::new("Work", "example.com", "alice");
+
+        forget_credential(&store, &profile);
+    }
+
+    #[test]
+    fn delete_host_forgets_its_saved_password() {
+        let mut app = test_app();
+        let profile = HostProfile {
+            auth: AuthMethod::Password,
+            ..HostProfile::new("Work", "example.com", "alice")
+        };
+        app.credential_store
+            .set_password(
+                &profile.host,
+                &profile.username,
+                &SecretString::from("hunter2".to_string()),
+            )
+            .unwrap();
+        let id = profile.id;
+        app.hosts.push(profile);
+
+        let _ = update_sidebar(&mut app, SidebarMessage::DeleteHost(id));
+
+        assert!(app
+            .credential_store
+            .get_password("example.com", "alice")
+            .unwrap()
+            .is_none());
     }
 }

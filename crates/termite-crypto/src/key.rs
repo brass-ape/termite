@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use secrecy::{ExposeSecret, SecretString};
-use ssh_key::{Algorithm, LineEnding, PrivateKey};
+use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey};
 
 use crate::error::CryptoError;
 
@@ -13,6 +13,15 @@ use crate::error::CryptoError;
 /// `.is_encrypted()` and call [`decrypt`] before using it.
 pub fn load(path: &Path) -> Result<PrivateKey, CryptoError> {
     PrivateKey::read_openssh_file(path).map_err(CryptoError::Key)
+}
+
+/// SHA-256 fingerprint (OpenSSH `SHA256:...` form) of a key's public part.
+/// Works whether or not `key` is currently encrypted — fingerprinting only
+/// touches the public component, never the private material — so this is
+/// safe to call before a passphrase is available, e.g. to look up or delete
+/// a saved passphrase keyed by fingerprint without decrypting the key.
+pub fn fingerprint(key: &PrivateKey) -> String {
+    key.public_key().fingerprint(HashAlg::Sha256).to_string()
 }
 
 /// Decrypts an encrypted private key using a passphrase. The passphrase is
@@ -82,6 +91,22 @@ mod tests {
         let loaded = load(&path).unwrap();
 
         assert!(decrypt(&loaded, &wrong_passphrase).is_err());
+    }
+
+    #[test]
+    fn fingerprint_survives_encryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        let key = generate_ed25519().unwrap();
+        let passphrase = SecretString::from("correct horse battery staple".to_string());
+
+        save_to_disk(&key, &path, Some(&passphrase)).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(loaded.is_encrypted());
+
+        // Fingerprinting only touches the public component, so it must not
+        // require (or be affected by) decryption.
+        assert_eq!(fingerprint(&loaded), fingerprint(&key));
     }
 
     #[test]

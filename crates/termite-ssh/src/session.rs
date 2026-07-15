@@ -316,10 +316,7 @@ async fn authenticate_publickey(
     let loaded = termite_crypto::key::load(key_path).map_err(|err| err.to_string())?;
 
     let key = if loaded.is_encrypted() {
-        let fingerprint = loaded
-            .public_key()
-            .fingerprint(russh::keys::HashAlg::Sha256)
-            .to_string();
+        let fingerprint = termite_crypto::key::fingerprint(&loaded);
 
         if !send_event(
             event_tx,

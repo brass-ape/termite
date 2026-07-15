@@ -65,4 +65,5 @@ pub trait CredentialStore: Send + Sync {
         fingerprint: &str,
         passphrase: &SecretString,
     ) -> Result<(), TermiteError>;
+    fn delete_passphrase(&self, fingerprint: &str) -> Result<(), TermiteError>;
 }

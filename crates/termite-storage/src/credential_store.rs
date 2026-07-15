@@ -86,6 +86,10 @@ impl CredentialStore for KeyringStore {
     ) -> Result<(), TermiteError> {
         self.set(&passphrase_key(fingerprint), passphrase)
     }
+
+    fn delete_passphrase(&self, fingerprint: &str) -> Result<(), TermiteError> {
+        self.delete(&passphrase_key(fingerprint))
+    }
 }
 
 /// An in-memory [`CredentialStore`] for tests — never touches the OS
@@ -158,6 +162,11 @@ impl CredentialStore for MemoryStore {
         self.set(&passphrase_key(fingerprint), passphrase);
         Ok(())
     }
+
+    fn delete_passphrase(&self, fingerprint: &str) -> Result<(), TermiteError> {
+        self.delete(&passphrase_key(fingerprint));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +204,18 @@ mod tests {
         store.set_passphrase("SHA256:abc123", &passphrase).unwrap();
         let retrieved = store.get_passphrase("SHA256:abc123").unwrap().unwrap();
         assert_eq!(retrieved.expose_secret(), "correct horse battery staple");
+    }
+
+    #[test]
+    fn memory_store_passphrase_delete() {
+        let store = MemoryStore::new();
+        let passphrase = SecretString::from("correct horse battery staple".to_string());
+
+        store.set_passphrase("SHA256:abc123", &passphrase).unwrap();
+        store.delete_passphrase("SHA256:abc123").unwrap();
+        assert!(store.get_passphrase("SHA256:abc123").unwrap().is_none());
+
+        // Deleting an entry that was never set is not an error.
+        store.delete_passphrase("SHA256:never-set").unwrap();
     }
 }
