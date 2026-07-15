@@ -63,6 +63,17 @@ pub struct HostProfile {
     pub username: String,
     pub auth: AuthMethod,
     pub tags: Vec<String>,
+    /// Starred by the user — sorted to the top of the sidebar ahead of
+    /// everything else. `#[serde(default)]` so `hosts.toml` files written
+    /// before this field existed still load (missing means "not starred").
+    #[serde(default)]
+    pub favourite: bool,
+    /// Unix timestamp (seconds) of the last time this profile was
+    /// connected to, if ever. Used to order non-favourite hosts by
+    /// recency. `#[serde(default)]` for the same pre-existing-file reason
+    /// as `favourite`.
+    #[serde(default)]
+    pub last_connected: Option<u64>,
 }
 
 impl HostProfile {
@@ -80,6 +91,8 @@ impl HostProfile {
             username: username.into(),
             auth: AuthMethod::Agent,
             tags: Vec::new(),
+            favourite: false,
+            last_connected: None,
         }
     }
 }

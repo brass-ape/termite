@@ -221,4 +221,35 @@ mod tests {
         store.delete(a.id).unwrap();
         assert_eq!(store.list().unwrap(), vec![b]);
     }
+
+    #[test]
+    fn hosts_file_written_before_favourite_and_last_connected_existed_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.toml");
+        // Deliberately omits `favourite`/`last_connected` — a hand-written
+        // stand-in for a hosts.toml saved by an older Termite build, before
+        // those fields existed.
+        std::fs::write(
+            &path,
+            r#"
+            [[hosts]]
+            id = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+            name = "legacy"
+            host = "example.com"
+            port = 22
+            username = "alice"
+            tags = []
+
+            [hosts.auth]
+            type = "agent"
+            "#,
+        )
+        .unwrap();
+
+        let store = TomlHostStore::new(path);
+        let hosts = store.list().unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert!(!hosts[0].favourite);
+        assert_eq!(hosts[0].last_connected, None);
+    }
 }
