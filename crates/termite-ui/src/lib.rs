@@ -7,8 +7,10 @@
 
 pub mod prompt;
 pub mod sidebar;
+pub mod tabbar;
 pub mod theme;
 
 pub use prompt::{Prompt, PromptMessage};
 pub use sidebar::{AuthKind, SidebarMessage, SidebarState};
+pub use tabbar::{TabBarMessage, TabSummary};
 pub use theme::TermiteTheme;

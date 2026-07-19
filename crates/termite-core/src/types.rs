@@ -28,6 +28,34 @@ impl fmt::Display for SessionId {
     }
 }
 
+// ── Tab identity ──────────────────────────────────────────────────────────────
+
+/// Unique identifier for a UI tab. Independent of [`SessionId`]: a local
+/// shell tab has a `TabId` but no SSH session at all, and an SSH-backed tab
+/// keeps the same `TabId` across a reconnect even though it's assigned a new
+/// `SessionId` each time. Never persisted, so unlike `SessionId`/`HostId` it
+/// derives no `Serialize`/`Deserialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TabId(Uuid);
+
+impl TabId {
+    pub fn new() -> Self {
+        TabId(Uuid::new_v4())
+    }
+}
+
+impl Default for TabId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for TabId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // ── Host identity ─────────────────────────────────────────────────────────────
 /// Unique identifier for a saved host profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

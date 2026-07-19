@@ -11,25 +11,101 @@ use iced::futures::channel::mpsc as bridge;
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
-use iced::widget::{row, text, Stack};
+use iced::widget::{column, row, text, Stack};
 use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
 use secrecy::SecretString;
 
-use termite_core::{AuthMethod, CredentialStore, HostProfile, SessionId, TermiteError};
+use termite_core::{
+    AuthMethod, ConnectionStatus, CredentialStore, HostProfile, SessionId, TabId, TermiteError,
+};
 use termite_ssh::{
-    AuthChallenge, AuthResponse, HostConfig, HostKey, SessionCommand, SessionEvent, SshConfig,
-    SshSession,
+    AuthChallenge, AuthResponse, DisconnectReason, HostConfig, HostKey, SessionCommand,
+    SessionEvent, SshConfig, SshSession,
 };
 use termite_storage::{HostStore, KeyringStore, MemoryHostStore, TomlHostStore};
 use termite_terminal::{GridHandler, Pty, TerminalGrid};
-use termite_ui::{prompt, sidebar, AuthKind, Prompt, PromptMessage, SidebarMessage, SidebarState};
+use termite_ui::{
+    prompt, sidebar, tabbar, AuthKind, Prompt, PromptMessage, SidebarMessage, SidebarState,
+    TabBarMessage, TabSummary,
+};
 
 /// Default grid size until real window-size-driven resizing lands (M6).
 const ROWS: usize = 30;
 const COLS: usize = 100;
 
-/// How often the output buffer is drained and fed to the VT parser.
+/// How often each local tab's output buffer is drained and fed to its VT
+/// parser.
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How many consecutive automatic reconnect attempts a dropped SSH tab gets
+/// before it's left `Disconnected` for the user to retry manually.
+const MAX_RECONNECT_ATTEMPTS: u32 = 6;
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+
+/// What a tab's byte source is. A local tab owns its own PTY end-to-end; an
+/// SSH tab's bytes flow through the `ssh_worker` subscription instead, keyed
+/// by `session_id`.
+enum TabKind {
+    Local {
+        writer: Box<dyn Write + Send>,
+        output: Arc<Mutex<Vec<u8>>>,
+        /// Kept alive so the pty and child shell aren't torn down.
+        _pty: Pty,
+    },
+    Ssh {
+        /// `None` between the tab being created and the `SessionSpawned`
+        /// message confirming the id `SshSession::spawn` assigned it (the
+        /// worker generates the id itself; see `ssh_worker`). Also cleared
+        /// back to `None` while a reconnect is pending, since the old
+        /// session is dead and nothing should be sent to it.
+        session_id: Option<SessionId>,
+        profile: HostProfile,
+        reconnect_attempt: u32,
+    },
+}
+
+impl TabKind {
+    fn session_id(&self) -> Option<SessionId> {
+        match self {
+            TabKind::Local { .. } => None,
+            TabKind::Ssh { session_id, .. } => *session_id,
+        }
+    }
+}
+
+/// One open tab: its own terminal grid/parser plus whatever's feeding it.
+struct Tab {
+    id: TabId,
+    title: String,
+    grid: TerminalGrid,
+    parser: vte::Parser,
+    kind: TabKind,
+    status: ConnectionStatus,
+}
+
+impl Tab {
+    fn new(title: impl Into<String>, kind: TabKind, status: ConnectionStatus) -> Self {
+        Self {
+            id: TabId::new(),
+            title: title.into(),
+            grid: TerminalGrid::new(ROWS, COLS),
+            parser: vte::Parser::new(),
+            kind,
+            status,
+        }
+    }
+
+    /// Feeds raw bytes through this tab's own VT parser into its own grid.
+    fn advance(&mut self, bytes: &[u8]) {
+        let mut handler = GridHandler {
+            grid: &mut self.grid,
+        };
+        for &byte in bytes {
+            self.parser.advance(&mut handler, byte);
+        }
+    }
+}
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -37,13 +113,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 ///
 /// Extended in M1+ as sessions, host profiles, and UI state are added.
 pub struct TermiteApp {
-    grid: TerminalGrid,
-    parser: vte::Parser,
-    output: Arc<Mutex<Vec<u8>>>,
-    writer: Box<dyn Write + Send>,
-    /// Kept alive so the pty and child shell aren't torn down; unused
-    /// otherwise until session lifecycle (M2+) needs it.
-    _pty: Pty,
+    // ── M5: tabs ────────────────────────────────────────────────────
+    /// Every open tab, in display order. Never empty after `new()` — closing
+    /// the last tab immediately reopens a fresh local one (see `close_tab`).
+    tabs: Vec<Tab>,
+    /// Which tab is receiving keystrokes and shown in the terminal pane.
+    /// Only `None` in the brief window during `new()` before the first tab
+    /// is pushed.
+    active_tab: Option<TabId>,
 
     // ── M4: host management ──────────────────────────────────────────
     host_store: Arc<dyn HostStore>,
@@ -62,9 +139,6 @@ pub struct TermiteApp {
     /// Sender into the persistent SSH worker subscription; `None` until its
     /// first poll delivers `Message::SshWorkerReady`.
     ssh_worker: Option<bridge::Sender<SshWorkerInput>>,
-    /// The session currently receiving keystrokes and rendering into
-    /// `grid`, if any. `None` means the local shell PTY has focus.
-    active_session: Option<SessionId>,
     /// A credential or host-key prompt currently blocking a session,
     /// waiting on the user. `None` means no modal is shown. Only one prompt
     /// is surfaced at a time; per `CLAUDE.md`'s no-silent-accept invariant,
@@ -102,54 +176,103 @@ impl PendingPrompt {
 
 impl TermiteApp {
     fn new() -> Result<Self, termite_terminal::PtyError> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let pty = Pty::spawn(&shell, ROWS as u16, COLS as u16)?;
-
-        let mut reader = pty.try_clone_reader()?;
-        let writer = pty.take_writer()?;
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let reader_output = Arc::clone(&output);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(mut output) = reader_output.lock() {
-                            output.extend_from_slice(&buf[..n]);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let tab = spawn_local_tab()?;
+        let active_tab = Some(tab.id);
 
         Ok(Self {
-            grid: TerminalGrid::new(ROWS, COLS),
-            parser: vte::Parser::new(),
-            output,
-            writer,
-            _pty: pty,
+            tabs: vec![tab],
+            active_tab,
             host_store: make_host_store(),
             hosts: Vec::new(),
             sidebar: SidebarState::default(),
             ssh_config: load_ssh_config(),
             credential_store: Arc::new(KeyringStore::new()),
             ssh_worker: None,
-            active_session: None,
             pending_prompt: None,
         })
     }
 
-    /// Feeds raw PTY output bytes through the VT parser into the grid.
-    fn advance(&mut self, bytes: &[u8]) {
-        let parser = &mut self.parser;
-        let grid = &mut self.grid;
-        let mut handler = GridHandler { grid };
-        for &byte in bytes {
-            parser.advance(&mut handler, byte);
+    fn find_tab(&self, id: TabId) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    fn find_tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
+    fn find_tab_by_session_mut(&mut self, session_id: SessionId) -> Option<&mut Tab> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.kind.session_id() == Some(session_id))
+    }
+
+    fn active_tab(&self) -> Option<&Tab> {
+        self.active_tab.and_then(|id| self.find_tab(id))
+    }
+
+    fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        self.active_tab.and_then(move |id| self.find_tab_mut(id))
+    }
+}
+
+/// Spawns a new local shell PTY, its background reader thread, and wraps
+/// them into a fresh [`Tab`]. Used both for the app's initial tab and for
+/// `Message::NewLocalTab`.
+fn spawn_local_tab() -> Result<Tab, termite_terminal::PtyError> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let pty = Pty::spawn(&shell, ROWS as u16, COLS as u16)?;
+
+    let mut reader = pty.try_clone_reader()?;
+    let writer = pty.take_writer()?;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let reader_output = Arc::clone(&output);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut output) = reader_output.lock() {
+                        output.extend_from_slice(&buf[..n]);
+                    }
+                }
+                Err(_) => break,
+            }
         }
+    });
+
+    Ok(Tab::new(
+        "Local",
+        TabKind::Local {
+            writer,
+            output,
+            _pty: pty,
+        },
+        ConnectionStatus::Connected,
+    ))
+}
+
+/// Feeds `bytes` into the active tab's grid, for banner-style status text
+/// (import results, key-generation results) that isn't tied to any
+/// particular session. A no-op if there's no active tab (shouldn't happen
+/// outside tests).
+fn advance_active(app: &mut TermiteApp, bytes: &[u8]) {
+    if let Some(tab) = app.active_tab_mut() {
+        tab.advance(bytes);
+    }
+}
+
+/// Handles `Message::NewLocalTab`: spawns a new local tab and makes it
+/// active. A spawn failure is logged and otherwise ignored — the app
+/// already has at least one tab open, so there's nothing to fail closed.
+fn new_local_tab(app: &mut TermiteApp) {
+    match spawn_local_tab() {
+        Ok(tab) => {
+            app.active_tab = Some(tab.id);
+            app.tabs.push(tab);
+        }
+        Err(err) => tracing::error!(%err, "failed to spawn new local shell tab"),
     }
 }
 
@@ -230,8 +353,12 @@ fn unix_now() -> u64 {
 /// (see [`ssh_worker`]).
 #[derive(Debug, Clone)]
 pub enum SshWorkerInput {
-    /// Spawn a new session connecting to this host profile.
-    Connect(HostProfile),
+    /// Spawn a new session connecting to this host profile, for the tab
+    /// identified by `TabId` (which already exists in `TermiteApp::tabs` by
+    /// the time this is sent — see `update_sidebar`'s `SelectHost` arm and
+    /// `reconnect`). The worker echoes the resulting `SessionId` back via
+    /// `Message::SessionSpawned` since it — not the app — assigns it.
+    Connect(TabId, HostProfile),
     /// Forward a command to an already-spawned session.
     Send(SessionId, SessionCommand),
 }
@@ -265,12 +392,15 @@ fn ssh_worker() -> impl Stream<Item = Message> {
             tokio::select! {
                 input = input_rx.next() => {
                     match input {
-                        Some(SshWorkerInput::Connect(profile)) => {
+                        Some(SshWorkerInput::Connect(tab_id, profile)) => {
                             match termite_ssh::known_hosts::known_hosts_path() {
                                 Ok(known_hosts_path) => {
                                     let (id, command_tx) =
                                         SshSession::spawn(profile, known_hosts_path, event_tx.clone());
                                     sessions.insert(id, command_tx);
+                                    if output.send(Message::SessionSpawned(tab_id, id)).await.is_err() {
+                                        break;
+                                    }
                                 }
                                 Err(err) => {
                                     tracing::error!(%err, "cannot resolve known_hosts path");
@@ -330,6 +460,18 @@ pub enum Message {
     SessionEvent(SessionId, SessionEvent),
     /// Interaction with the pending credential/host-key modal, if any.
     Prompt(PromptMessage),
+
+    // ── M5: tabs ────────────────────────────────────────────────────
+    /// The worker finished spawning the session requested for this tab and
+    /// assigned it this id (see [`SshWorkerInput::Connect`]).
+    SessionSpawned(TabId, SessionId),
+    /// A scheduled automatic-reconnect backoff for this tab has elapsed.
+    /// No-op if the tab was closed in the meantime.
+    AttemptReconnect(TabId),
+    /// Opens a new local shell tab.
+    NewLocalTab,
+    /// Interaction with the tab bar.
+    TabBar(TabBarMessage),
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -355,23 +497,36 @@ fn initialize() -> (TermiteApp, Task<Message>) {
 fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
     match message {
         Message::PollOutput => {
-            let bytes = {
-                match app.output.lock() {
-                    Ok(mut output) => std::mem::take(&mut *output),
-                    Err(_) => Vec::new(),
+            for tab in &mut app.tabs {
+                let bytes = match &tab.kind {
+                    TabKind::Local { output, .. } => match output.lock() {
+                        Ok(mut output) => std::mem::take(&mut *output),
+                        Err(_) => Vec::new(),
+                    },
+                    TabKind::Ssh { .. } => Vec::new(),
+                };
+                if !bytes.is_empty() {
+                    tab.advance(&bytes);
                 }
-            };
-            if !bytes.is_empty() {
-                app.advance(&bytes);
             }
         }
         Message::KeyPressed { key, modifiers } => {
+            if let Some(task) = handle_tab_shortcut(app, &key, modifiers) {
+                return task;
+            }
             if let Some(bytes) = key_to_bytes(&key, modifiers) {
-                match app.active_session {
-                    Some(id) => send_to_session(app, id, SessionCommand::Write(bytes)),
-                    None => {
-                        let _ = app.writer.write_all(&bytes);
-                    }
+                let ssh_target = match app.active_tab_mut() {
+                    Some(tab) => match &mut tab.kind {
+                        TabKind::Local { writer, .. } => {
+                            let _ = writer.write_all(&bytes);
+                            None
+                        }
+                        TabKind::Ssh { session_id, .. } => *session_id,
+                    },
+                    None => None,
+                };
+                if let Some(id) = ssh_target {
+                    send_to_session(app, id, SessionCommand::Write(bytes));
                 }
             }
         }
@@ -383,31 +538,205 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
         Message::SshWorkerReady(sender) => {
             app.ssh_worker = Some(sender);
         }
-        Message::SessionEvent(id, event) => handle_session_event(app, id, event),
+        Message::SessionEvent(id, event) => return handle_session_event(app, id, event),
         Message::Prompt(message) => update_prompt(app, message),
+        Message::SessionSpawned(tab_id, session_id) => {
+            if let Some(tab) = app.find_tab_mut(tab_id) {
+                if let TabKind::Ssh {
+                    session_id: slot, ..
+                } = &mut tab.kind
+                {
+                    *slot = Some(session_id);
+                }
+            }
+        }
+        Message::AttemptReconnect(tab_id) => return reconnect(app, tab_id),
+        Message::NewLocalTab => new_local_tab(app),
+        Message::TabBar(message) => return update_tabbar(app, message),
     }
     Task::none()
 }
 
-/// Handles an event forwarded from a running SSH session. There is no
-/// dedicated status UI yet (that lands with tabs in M5), so connection
-/// lifecycle transitions are appended to the terminal grid as plain text —
-/// the only surface currently visible to the user.
+/// Handles interaction with the tab bar.
+fn update_tabbar(app: &mut TermiteApp, message: TabBarMessage) -> Task<Message> {
+    match message {
+        TabBarMessage::Select(id) => {
+            if app.find_tab(id).is_some() {
+                app.active_tab = Some(id);
+            }
+        }
+        TabBarMessage::Close(id) => return close_tab(app, id),
+        TabBarMessage::Retry(id) => return reconnect(app, id),
+        TabBarMessage::NewLocal => new_local_tab(app),
+    }
+    Task::none()
+}
+
+/// Removes tab `id`. Disconnects its live SSH session (if any) and clears
+/// any prompt waiting on it. If it was the active tab, activates a
+/// neighbor; if it was the only tab, immediately opens a fresh local one —
+/// `TermiteApp::tabs` is never left empty.
+fn close_tab(app: &mut TermiteApp, id: TabId) -> Task<Message> {
+    let Some(index) = app.tabs.iter().position(|tab| tab.id == id) else {
+        return Task::none();
+    };
+    let tab = app.tabs.remove(index);
+
+    if let Some(session_id) = tab.kind.session_id() {
+        send_to_session(app, session_id, SessionCommand::Disconnect);
+    }
+    if pending_prompt_session(&app.pending_prompt) == tab.kind.session_id() {
+        app.pending_prompt = None;
+    }
+
+    if app.active_tab == Some(id) {
+        app.active_tab = app
+            .tabs
+            .get(index.min(app.tabs.len().saturating_sub(1)))
+            .map(|tab| tab.id);
+    }
+
+    if app.tabs.is_empty() {
+        new_local_tab(app);
+    }
+    Task::none()
+}
+
+/// The exponential-with-cap delay before automatic reconnect attempt
+/// `attempt` (1-indexed): 2s, 4s, 8s, 16s, then capped at 30s.
+fn backoff_delay(attempt: u32) -> Duration {
+    let secs = 2u64.saturating_pow(attempt.min(5));
+    Duration::from_secs(secs.min(30))
+}
+
+/// (Re)connects tab `id` using its stored `HostProfile`, whether that's the
+/// first connection attempt, a scheduled automatic retry
+/// (`Message::AttemptReconnect`), or a user-initiated one
+/// (`TabBarMessage::Retry`). A no-op if the tab was closed in the meantime,
+/// isn't SSH-backed, or the worker isn't ready yet.
+fn reconnect(app: &mut TermiteApp, id: TabId) -> Task<Message> {
+    let Some(tab) = app.find_tab_mut(id) else {
+        return Task::none();
+    };
+    let TabKind::Ssh { profile, .. } = &tab.kind else {
+        return Task::none();
+    };
+    let profile = profile.clone();
+    tab.status = ConnectionStatus::Connecting;
+    match &app.ssh_worker {
+        Some(sender) => {
+            let mut sender = sender.clone();
+            let _ = sender.try_send(SshWorkerInput::Connect(id, profile));
+        }
+        None => tracing::warn!("ssh worker not ready yet; reconnect dropped"),
+    }
+    Task::none()
+}
+
+/// Intercepts Ctrl-held tab-navigation keys before they'd otherwise be
+/// forwarded as bytes to the active tab. Returns `None` for anything that
+/// isn't a tab shortcut, so the caller falls through to normal handling.
+/// (Today, unintercepted, Ctrl+Tab sends a literal tab byte and Ctrl+<digit>
+/// sends the bare digit — neither is a meaningful terminal control
+/// sequence, so claiming them here isn't a behavior regression.)
+fn handle_tab_shortcut(
+    app: &mut TermiteApp,
+    key: &Key,
+    modifiers: Modifiers,
+) -> Option<Task<Message>> {
+    if !modifiers.control() {
+        return None;
+    }
+    match key {
+        Key::Named(Named::Tab) => {
+            select_adjacent_tab(app, if modifiers.shift() { -1 } else { 1 });
+            Some(Task::none())
+        }
+        Key::Character(c) => {
+            let digit = c.chars().next()?.to_digit(10)?;
+            if (1..=9).contains(&digit) {
+                select_tab_by_index(app, digit as usize - 1);
+                Some(Task::none())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Moves `active_tab` forward (`delta = 1`) or backward (`delta = -1`),
+/// wrapping around. A no-op if there's no active tab (shouldn't happen
+/// outside tests, since `tabs` is never empty) or only one tab open.
+fn select_adjacent_tab(app: &mut TermiteApp, delta: isize) {
+    if app.tabs.len() < 2 {
+        return;
+    }
+    let Some(active) = app.active_tab else {
+        return;
+    };
+    let Some(current) = app.tabs.iter().position(|tab| tab.id == active) else {
+        return;
+    };
+    let len = app.tabs.len() as isize;
+    let next = ((current as isize + delta).rem_euclid(len)) as usize;
+    app.active_tab = Some(app.tabs[next].id);
+}
+
+/// Selects the tab at `index` (0-based), if one exists at that position.
+fn select_tab_by_index(app: &mut TermiteApp, index: usize) {
+    if let Some(tab) = app.tabs.get(index) {
+        app.active_tab = Some(tab.id);
+    }
+}
+
+/// The display data the tab bar renders, in `app.tabs`' order.
+fn tab_summaries(app: &TermiteApp) -> Vec<TabSummary> {
+    app.tabs
+        .iter()
+        .map(|tab| TabSummary {
+            id: tab.id,
+            title: tab.title.clone(),
+            status: tab.status.clone(),
+        })
+        .collect()
+}
+
+/// Handles an event forwarded from a running SSH session, routed to
+/// whichever tab owns `id` (see `find_tab_by_session_mut`) — a background
+/// tab keeps accumulating its own scrollback even while another tab is
+/// active, rather than the pre-M5 behavior of only rendering whatever
+/// session happened to be "active". Connection lifecycle transitions are
+/// also appended to that tab's grid as plain text alongside the tab bar's
+/// status indicator, since it's the more detailed of the two surfaces.
 ///
 /// `AuthRequired` and `HostKeyUnknown`/`HostKeyMismatch` open the credential
-/// or host-key modal (see `update_prompt`). Per `CLAUDE.md`'s no-silent-accept
-/// invariant, only one prompt is shown at a time: if a second one arrives
-/// while the modal is already open, it fails closed (auth disconnects,
-/// host-key rejects) rather than silently overwriting the pending decision.
-fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent) {
+/// or host-key modal (see `update_prompt`) and focus the owning tab so the
+/// modal is seen in context. Per `CLAUDE.md`'s no-silent-accept invariant,
+/// only one prompt is shown at a time: if a second one arrives while the
+/// modal is already open, it fails closed (auth disconnects, host-key
+/// rejects) rather than silently overwriting the pending decision.
+///
+/// `Disconnected` with anything other than a user-requested reason schedules
+/// an automatic reconnect with backoff (see `backoff_delay`), up to
+/// `MAX_RECONNECT_ATTEMPTS`, via the `Task` this returns.
+fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent) -> Task<Message> {
     match event {
         SessionEvent::Connected => {
-            app.active_session = Some(id);
-            app.advance(b"\r\n*** connected ***\r\n");
+            if let Some(tab) = app.find_tab_by_session_mut(id) {
+                tab.status = ConnectionStatus::Connected;
+                if let TabKind::Ssh {
+                    reconnect_attempt, ..
+                } = &mut tab.kind
+                {
+                    *reconnect_attempt = 0;
+                }
+                tab.advance(b"\r\n*** connected ***\r\n");
+            }
         }
         SessionEvent::Output(bytes) => {
-            if app.active_session == Some(id) {
-                app.advance(&bytes);
+            if let Some(tab) = app.find_tab_by_session_mut(id) {
+                tab.advance(&bytes);
             }
         }
         SessionEvent::AuthRequired(challenge) => {
@@ -417,7 +746,7 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
                     "a prompt is already pending; disconnecting session"
                 );
                 send_to_session(app, id, SessionCommand::Disconnect);
-                return;
+                return Task::none();
             }
             if let Some(secret) = saved_credential(app, &challenge) {
                 let response = match &challenge {
@@ -425,8 +754,9 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
                     AuthChallenge::Passphrase { .. } => AuthResponse::Passphrase(secret),
                 };
                 send_to_session(app, id, SessionCommand::AuthResponse(response));
-                return;
+                return Task::none();
             }
+            focus_tab_for_session(app, id);
             let label = match &challenge {
                 AuthChallenge::Password { .. } => {
                     "Password required to continue connecting".to_string()
@@ -453,18 +783,65 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
         }
         SessionEvent::Disconnected { reason } => {
             tracing::info!(?reason, "ssh session disconnected");
-            app.advance(format!("\r\n*** disconnected: {reason:?} ***\r\n").as_bytes());
-            if app.active_session == Some(id) {
-                app.active_session = None;
-            }
             if pending_prompt_session(&app.pending_prompt) == Some(id) {
                 app.pending_prompt = None;
+            }
+            if let Some(tab) = app.find_tab_by_session_mut(id) {
+                tab.advance(format!("\r\n*** disconnected: {reason:?} ***\r\n").as_bytes());
+                let tab_id = tab.id;
+                let (should_retry, attempt) = match &mut tab.kind {
+                    TabKind::Ssh {
+                        session_id,
+                        reconnect_attempt,
+                        ..
+                    } => {
+                        *session_id = None;
+                        let should_retry = !matches!(reason, DisconnectReason::Requested)
+                            && *reconnect_attempt < MAX_RECONNECT_ATTEMPTS;
+                        if should_retry {
+                            *reconnect_attempt += 1;
+                        }
+                        (should_retry, *reconnect_attempt)
+                    }
+                    TabKind::Local { .. } => (false, 0),
+                };
+                tab.status = if should_retry {
+                    ConnectionStatus::Reconnecting { attempt }
+                } else {
+                    ConnectionStatus::Disconnected
+                };
+                if should_retry {
+                    // The `sleep` future is built *inside* the async block
+                    // rather than passed to `Task::perform` directly:
+                    // `tokio::time::sleep` registers with the runtime's timer
+                    // driver as soon as it's constructed, which panics
+                    // outside a Tokio runtime context (e.g. in a plain
+                    // `#[test]` fn that never polls this `Task` at all).
+                    // Deferring construction until the future is actually
+                    // polled avoids that.
+                    let delay = backoff_delay(attempt);
+                    return Task::perform(
+                        async move { tokio::time::sleep(delay).await },
+                        move |_| Message::AttemptReconnect(tab_id),
+                    );
+                }
             }
         }
         SessionEvent::Error(message) => {
             tracing::error!(%message, "ssh session error");
-            app.advance(format!("\r\n*** error: {message} ***\r\n").as_bytes());
+            if let Some(tab) = app.find_tab_by_session_mut(id) {
+                tab.advance(format!("\r\n*** error: {message} ***\r\n").as_bytes());
+            }
         }
+    }
+    Task::none()
+}
+
+/// Switches `active_tab` to whichever tab owns SSH session `id`, if any —
+/// used when a prompt opens for a session that isn't currently focused.
+fn focus_tab_for_session(app: &mut TermiteApp, id: SessionId) {
+    if let Some(tab_id) = app.find_tab_by_session_mut(id).map(|tab| tab.id) {
+        app.active_tab = Some(tab_id);
     }
 }
 
@@ -561,6 +938,7 @@ fn open_host_key_prompt(app: &mut TermiteApp, session: SessionId, key: HostKey, 
         send_to_session(app, session, SessionCommand::ApproveHostKey(false));
         return;
     }
+    focus_tab_for_session(app, session);
     let label = if mismatch {
         "Host key changed! This may indicate an attack — verify before trusting.".to_string()
     } else {
@@ -965,10 +1343,22 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
         }
         SidebarMessage::SelectHost(id) => {
             if let Some(mut profile) = app.hosts.iter().find(|host| host.id == id).cloned() {
+                let tab = Tab::new(
+                    profile.name.clone(),
+                    TabKind::Ssh {
+                        session_id: None,
+                        profile: profile.clone(),
+                        reconnect_attempt: 0,
+                    },
+                    ConnectionStatus::Connecting,
+                );
+                let tab_id = tab.id;
+                app.tabs.push(tab);
+                app.active_tab = Some(tab_id);
                 match &app.ssh_worker {
                     Some(sender) => {
                         let mut sender = sender.clone();
-                        let _ = sender.try_send(SshWorkerInput::Connect(profile.clone()));
+                        let _ = sender.try_send(SshWorkerInput::Connect(tab_id, profile.clone()));
                     }
                     None => tracing::warn!("ssh worker not ready yet; connect request dropped"),
                 }
@@ -1007,12 +1397,16 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                 .collect();
 
             if new_profiles.is_empty() {
-                app.advance(b"\r\n*** no new hosts to import from ~/.ssh/config ***\r\n");
+                advance_active(
+                    app,
+                    b"\r\n*** no new hosts to import from ~/.ssh/config ***\r\n",
+                );
                 return Task::none();
             }
 
             let count = new_profiles.len();
-            app.advance(
+            advance_active(
+                app,
                 format!("\r\n*** importing {count} host(s) from ~/.ssh/config ***\r\n").as_bytes(),
             );
             let store = Arc::clone(&app.host_store);
@@ -1039,7 +1433,8 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                 PathBuf::from(&app.sidebar.key_path_input)
             };
             if path.exists() {
-                app.advance(
+                advance_active(
+                    app,
                     format!(
                         "\r\n*** refusing to generate key: {} already exists ***\r\n",
                         path.display()
@@ -1054,7 +1449,8 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                 Ok(fingerprint) => {
                     app.sidebar.key_path_input = path.display().to_string();
                     app.sidebar.auth_kind = AuthKind::PublicKey;
-                    app.advance(
+                    advance_active(
+                        app,
                         format!(
                             "\r\n*** generated ed25519 key {} ({fingerprint}) ***\r\n",
                             path.display()
@@ -1064,7 +1460,7 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                 }
                 Err(err) => {
                     tracing::error!(%err, "key generation failed");
-                    app.advance(b"\r\n*** key generation failed; see logs ***\r\n");
+                    advance_active(app, b"\r\n*** key generation failed; see logs ***\r\n");
                 }
             }
         }
@@ -1075,13 +1471,21 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
 fn view(app: &TermiteApp) -> Element<'_, Message> {
     let sidebar = sidebar::view(&app.hosts, &app.sidebar).map(Message::Sidebar);
 
-    let rows = app.grid.visible_rows().join("\n");
+    let summaries = tab_summaries(app);
+    let tab_bar = tabbar::view(&summaries, app.active_tab).map(Message::TabBar);
+
+    let rows = app
+        .active_tab()
+        .map(|tab| tab.grid.visible_rows().join("\n"))
+        .unwrap_or_default();
     let terminal = text(rows)
         .font(Font::MONOSPACE)
         .size(14)
         .width(Length::Fill);
 
-    let content: Element<'_, Message> = row![sidebar, terminal].into();
+    let pane = column![tab_bar, terminal].width(Length::Fill);
+
+    let content: Element<'_, Message> = row![sidebar, pane].into();
 
     match &app.pending_prompt {
         Some(pending) => {
@@ -1173,6 +1577,10 @@ mod tests {
         rx
     }
 
+    fn active_grid_rows(app: &TermiteApp) -> Vec<String> {
+        app.active_tab().expect("an active tab").grid.visible_rows()
+    }
+
     fn test_host_key() -> HostKey {
         HostKey {
             algorithm: "ssh-ed25519".to_string(),
@@ -1192,7 +1600,7 @@ mod tests {
         let mut app = test_app();
         let id = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(test_password_challenge()),
@@ -1219,7 +1627,7 @@ mod tests {
         let mut app = test_app();
         let id = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(AuthChallenge::Passphrase {
@@ -1242,7 +1650,7 @@ mod tests {
         let id = SessionId::new();
         let key = test_host_key();
 
-        handle_session_event(&mut app, id, SessionEvent::HostKeyUnknown(key.clone()));
+        let _ = handle_session_event(&mut app, id, SessionEvent::HostKeyUnknown(key.clone()));
 
         match &app.pending_prompt {
             Some(PendingPrompt::HostKey {
@@ -1269,7 +1677,7 @@ mod tests {
         let mut app = test_app();
         let id = SessionId::new();
 
-        handle_session_event(&mut app, id, SessionEvent::HostKeyMismatch(test_host_key()));
+        let _ = handle_session_event(&mut app, id, SessionEvent::HostKeyMismatch(test_host_key()));
 
         match &app.pending_prompt {
             Some(PendingPrompt::HostKey {
@@ -1287,12 +1695,12 @@ mod tests {
         let first = SessionId::new();
         let second = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             first,
             SessionEvent::AuthRequired(test_password_challenge()),
         );
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             second,
             SessionEvent::AuthRequired(test_password_challenge()),
@@ -1317,12 +1725,12 @@ mod tests {
         let first = SessionId::new();
         let second = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             first,
             SessionEvent::HostKeyUnknown(test_host_key()),
         );
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             second,
             SessionEvent::HostKeyUnknown(test_host_key()),
@@ -1346,7 +1754,7 @@ mod tests {
         let mut rx = wire_fake_worker(&mut app);
         let id = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(test_password_challenge()),
@@ -1373,7 +1781,7 @@ mod tests {
         let mut rx = wire_fake_worker(&mut app);
         let id = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(test_password_challenge()),
@@ -1406,7 +1814,7 @@ mod tests {
         let mut rx = wire_fake_worker(&mut app);
         let id = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(test_password_challenge()),
@@ -1431,7 +1839,7 @@ mod tests {
             .set_password("example.com", "alice", &SecretString::from("hunter2"))
             .unwrap();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(test_password_challenge()),
@@ -1456,7 +1864,7 @@ mod tests {
         let mut rx = wire_fake_worker(&mut app);
         let id = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(AuthChallenge::Passphrase {
@@ -1486,7 +1894,7 @@ mod tests {
         let mut rx = wire_fake_worker(&mut app);
         let id = SessionId::new();
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(test_password_challenge()),
@@ -1508,7 +1916,7 @@ mod tests {
         let mut rx = wire_fake_worker(&mut app);
         let id = SessionId::new();
 
-        handle_session_event(&mut app, id, SessionEvent::HostKeyUnknown(test_host_key()));
+        let _ = handle_session_event(&mut app, id, SessionEvent::HostKeyUnknown(test_host_key()));
         update_prompt(&mut app, PromptMessage::Approve);
 
         assert!(app.pending_prompt.is_none());
@@ -1526,7 +1934,7 @@ mod tests {
         let mut rx = wire_fake_worker(&mut app);
         let id = SessionId::new();
 
-        handle_session_event(&mut app, id, SessionEvent::HostKeyMismatch(test_host_key()));
+        let _ = handle_session_event(&mut app, id, SessionEvent::HostKeyMismatch(test_host_key()));
         update_prompt(&mut app, PromptMessage::Reject);
 
         assert!(app.pending_prompt.is_none());
@@ -1542,14 +1950,14 @@ mod tests {
     fn disconnect_clears_prompt_for_its_own_session() {
         let mut app = test_app();
         let id = SessionId::new();
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::AuthRequired(test_password_challenge()),
         );
         assert!(app.pending_prompt.is_some());
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             id,
             SessionEvent::Disconnected {
@@ -1565,13 +1973,13 @@ mod tests {
         let mut app = test_app();
         let prompting = SessionId::new();
         let other = SessionId::new();
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             prompting,
             SessionEvent::AuthRequired(test_password_challenge()),
         );
 
-        handle_session_event(
+        let _ = handle_session_event(
             &mut app,
             other,
             SessionEvent::Disconnected {
@@ -2022,17 +2430,27 @@ mod tests {
     }
 
     #[test]
-    fn select_host_sends_connect_to_the_ssh_worker() {
+    fn select_host_opens_a_new_tab_and_sends_connect_to_the_ssh_worker() {
         let mut app = test_app();
         let mut rx = wire_fake_worker(&mut app);
         let profile = HostProfile::new("Work", "example.com", "alice");
         let id = profile.id;
         app.hosts.push(profile);
+        let tab_count_before = app.tabs.len();
 
         let _ = update_sidebar(&mut app, SidebarMessage::SelectHost(id));
 
+        assert_eq!(app.tabs.len(), tab_count_before + 1);
+        let new_tab = app.tabs.last().expect("a tab was pushed");
+        assert_eq!(app.active_tab, Some(new_tab.id));
+        assert_eq!(new_tab.title, "Work");
+        assert_eq!(new_tab.status, ConnectionStatus::Connecting);
+
         match rx.try_recv() {
-            Ok(SshWorkerInput::Connect(profile)) => assert_eq!(profile.id, id),
+            Ok(SshWorkerInput::Connect(tab_id, profile)) => {
+                assert_eq!(tab_id, new_tab.id);
+                assert_eq!(profile.id, id);
+            }
             other => panic!("expected a Connect for the selected host, got {other:?}"),
         }
     }
@@ -2046,9 +2464,7 @@ mod tests {
 
         let _ = update_sidebar(&mut app, SidebarMessage::ImportFromSshConfig);
 
-        assert!(app
-            .grid
-            .visible_rows()
+        assert!(active_grid_rows(&app)
             .iter()
             .any(|row| row.contains("no new hosts")));
     }
@@ -2061,9 +2477,7 @@ mod tests {
 
         let _ = update_sidebar(&mut app, SidebarMessage::ImportFromSshConfig);
 
-        assert!(app
-            .grid
-            .visible_rows()
+        assert!(active_grid_rows(&app)
             .iter()
             .any(|row| row.contains("importing 1 host")));
     }
@@ -2081,9 +2495,7 @@ mod tests {
         // Refused, so the existing file's contents are untouched and the
         // key-path field wasn't cleared/replaced by this attempt.
         assert_eq!(std::fs::read(&path).unwrap(), b"already here");
-        assert!(app
-            .grid
-            .visible_rows()
+        assert!(active_grid_rows(&app)
             .iter()
             .any(|row| row.contains("already exists")));
     }
@@ -2101,5 +2513,259 @@ mod tests {
         assert!(path.exists());
         assert_eq!(app.sidebar.auth_kind, AuthKind::PublicKey);
         assert_eq!(app.sidebar.key_path_input, path.display().to_string());
+    }
+
+    // ── M5: tabs ────────────────────────────────────────────────────────────
+
+    /// Pushes an SSH-backed tab directly (bypassing `SelectHost`/the worker)
+    /// and makes it active, for tests that only care about tab-lifecycle
+    /// logic, not the connect handshake.
+    fn push_ssh_tab(app: &mut TermiteApp, session_id: Option<SessionId>) -> TabId {
+        let profile = HostProfile::new("Work", "example.com", "alice");
+        let tab = Tab::new(
+            profile.name.clone(),
+            TabKind::Ssh {
+                session_id,
+                profile,
+                reconnect_attempt: 0,
+            },
+            ConnectionStatus::Connected,
+        );
+        let id = tab.id;
+        app.tabs.push(tab);
+        app.active_tab = Some(id);
+        id
+    }
+
+    #[test]
+    fn new_local_tab_message_adds_and_activates_a_tab() {
+        let mut app = test_app();
+        let tab_count_before = app.tabs.len();
+
+        let _ = update(&mut app, Message::NewLocalTab);
+
+        assert_eq!(app.tabs.len(), tab_count_before + 1);
+        assert_eq!(app.active_tab, app.tabs.last().map(|tab| tab.id));
+    }
+
+    #[test]
+    fn close_tab_activates_a_neighbor_when_the_active_tab_is_closed() {
+        let mut app = test_app();
+        let first = app.active_tab.expect("a starting tab");
+        let _ = update(&mut app, Message::NewLocalTab);
+        let second = app.active_tab.expect("the new tab is active");
+        assert_ne!(first, second);
+
+        let _ = close_tab(&mut app, second);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, Some(first));
+    }
+
+    #[test]
+    fn close_tab_on_the_only_tab_reopens_a_fresh_local_tab() {
+        let mut app = test_app();
+        let only = app.active_tab.expect("a starting tab");
+
+        let _ = close_tab(&mut app, only);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_ne!(app.active_tab, Some(only));
+    }
+
+    #[test]
+    fn close_tab_disconnects_a_live_ssh_session() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+
+        let _ = close_tab(&mut app, tab_id);
+
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(id, SessionCommand::Disconnect)) => {
+                assert_eq!(id, session_id);
+            }
+            other => panic!("expected a Disconnect for the closed tab's session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_tab_clears_a_pending_prompt_for_its_session() {
+        let mut app = test_app();
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+        let _ = handle_session_event(
+            &mut app,
+            session_id,
+            SessionEvent::AuthRequired(test_password_challenge()),
+        );
+        assert!(app.pending_prompt.is_some());
+
+        let _ = close_tab(&mut app, tab_id);
+
+        assert!(app.pending_prompt.is_none());
+    }
+
+    #[test]
+    fn session_spawned_fills_in_the_tabs_session_id() {
+        let mut app = test_app();
+        let tab_id = push_ssh_tab(&mut app, None);
+        let session_id = SessionId::new();
+
+        let _ = update(&mut app, Message::SessionSpawned(tab_id, session_id));
+
+        match &app.find_tab(tab_id).expect("tab still exists").kind {
+            TabKind::Ssh { session_id: id, .. } => assert_eq!(*id, Some(session_id)),
+            TabKind::Local { .. } => panic!("expected an SSH tab"),
+        }
+    }
+
+    #[test]
+    fn disconnected_with_a_non_requested_reason_schedules_a_reconnect() {
+        let mut app = test_app();
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+
+        let _ = handle_session_event(
+            &mut app,
+            session_id,
+            SessionEvent::Disconnected {
+                reason: DisconnectReason::Remote,
+            },
+        );
+
+        let tab = app.find_tab(tab_id).expect("tab still exists");
+        assert_eq!(tab.status, ConnectionStatus::Reconnecting { attempt: 1 });
+        assert_eq!(tab.kind.session_id(), None);
+    }
+
+    #[test]
+    fn disconnected_with_a_requested_reason_does_not_reconnect() {
+        let mut app = test_app();
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+
+        let _ = handle_session_event(
+            &mut app,
+            session_id,
+            SessionEvent::Disconnected {
+                reason: DisconnectReason::Requested,
+            },
+        );
+
+        let tab = app.find_tab(tab_id).expect("tab still exists");
+        assert_eq!(tab.status, ConnectionStatus::Disconnected);
+    }
+
+    #[test]
+    fn disconnected_stops_auto_reconnecting_past_the_attempt_cap() {
+        let mut app = test_app();
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+        if let TabKind::Ssh {
+            reconnect_attempt, ..
+        } = &mut app.find_tab_mut(tab_id).unwrap().kind
+        {
+            *reconnect_attempt = MAX_RECONNECT_ATTEMPTS;
+        }
+
+        let _ = handle_session_event(
+            &mut app,
+            session_id,
+            SessionEvent::Disconnected {
+                reason: DisconnectReason::Remote,
+            },
+        );
+
+        let tab = app.find_tab(tab_id).expect("tab still exists");
+        assert_eq!(tab.status, ConnectionStatus::Disconnected);
+    }
+
+    #[test]
+    fn reconnect_sends_connect_for_the_tabs_stored_profile() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let tab_id = push_ssh_tab(&mut app, None);
+
+        let _ = reconnect(&mut app, tab_id);
+
+        assert_eq!(
+            app.find_tab(tab_id).unwrap().status,
+            ConnectionStatus::Connecting
+        );
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Connect(id, profile)) => {
+                assert_eq!(id, tab_id);
+                assert_eq!(profile.name, "Work");
+            }
+            other => panic!("expected a Connect for the reconnecting tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_adjacent_tab_wraps_around_in_both_directions() {
+        let mut app = test_app();
+        let first = app.active_tab.unwrap();
+        let _ = update(&mut app, Message::NewLocalTab);
+        let second = app.active_tab.unwrap();
+        let _ = update(&mut app, Message::NewLocalTab);
+        let third = app.active_tab.unwrap();
+        app.active_tab = Some(first);
+
+        select_adjacent_tab(&mut app, 1);
+        assert_eq!(app.active_tab, Some(second));
+        select_adjacent_tab(&mut app, 1);
+        assert_eq!(app.active_tab, Some(third));
+        select_adjacent_tab(&mut app, 1);
+        assert_eq!(app.active_tab, Some(first), "should wrap back to the start");
+
+        select_adjacent_tab(&mut app, -1);
+        assert_eq!(app.active_tab, Some(third), "should wrap backward too");
+    }
+
+    #[test]
+    fn select_tab_by_index_ignores_an_out_of_range_index() {
+        let mut app = test_app();
+        let only = app.active_tab.unwrap();
+
+        select_tab_by_index(&mut app, 5);
+
+        assert_eq!(app.active_tab, Some(only));
+    }
+
+    #[test]
+    fn ctrl_tab_shortcut_switches_the_active_tab() {
+        let mut app = test_app();
+        let first = app.active_tab.unwrap();
+        let _ = update(&mut app, Message::NewLocalTab);
+        let second = app.active_tab.unwrap();
+        app.active_tab = Some(first);
+
+        let task = handle_tab_shortcut(&mut app, &Key::Named(Named::Tab), Modifiers::CTRL);
+
+        assert!(task.is_some());
+        assert_eq!(app.active_tab, Some(second));
+    }
+
+    #[test]
+    fn ctrl_digit_shortcut_selects_tab_by_position() {
+        let mut app = test_app();
+        let first = app.active_tab.unwrap();
+        let _ = update(&mut app, Message::NewLocalTab);
+
+        let task = handle_tab_shortcut(&mut app, &Key::Character("1".into()), Modifiers::CTRL);
+
+        assert!(task.is_some());
+        assert_eq!(app.active_tab, Some(first));
+    }
+
+    #[test]
+    fn plain_tab_key_is_not_claimed_as_a_shortcut() {
+        let mut app = test_app();
+
+        let task = handle_tab_shortcut(&mut app, &Key::Named(Named::Tab), Modifiers::empty());
+
+        assert!(task.is_none());
     }
 }

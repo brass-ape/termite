@@ -10,4 +10,4 @@ pub mod types;
 
 pub use error::TermiteError;
 pub use traits::{CredentialStore, KeyProvider, RsaHashAlg};
-pub use types::{AuthMethod, ConnectionStatus, HostId, HostProfile, SessionId};
+pub use types::{AuthMethod, ConnectionStatus, HostId, HostProfile, SessionId, TabId};
