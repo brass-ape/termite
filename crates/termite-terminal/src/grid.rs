@@ -28,6 +28,26 @@ impl EraseMode {
     }
 }
 
+/// Which mouse events an application has asked to receive, set by DEC
+/// private modes `?9`/`?1000`/`?1002`/`?1003`. Encoding the reported bytes
+/// (legacy vs. SGR, cell math) is a UI-input concern and lives in
+/// `termite-app`, mirroring where `key_to_bytes` lives rather than in this
+/// crate — this type only tracks *what the application asked for*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseTracking {
+    /// No mouse mode active; the default.
+    #[default]
+    Off,
+    /// `?9` — report a button press only, no release or motion.
+    X10,
+    /// `?1000` — report button press and release.
+    Normal,
+    /// `?1002` — `Normal` plus motion while a button is held (dragging).
+    ButtonEvent,
+    /// `?1003` — `ButtonEvent` plus motion with no button held.
+    AnyEvent,
+}
+
 /// A fixed-size 2D buffer of [`Cell`]s, plus the cursor and screen-mode state
 /// needed to interpret a VT byte stream.
 #[derive(Debug, Clone)]
@@ -60,6 +80,13 @@ pub struct TerminalGrid {
     /// should be wrapped in `ESC[200~`/`ESC[201~` before being sent to the
     /// shell, so a pasting app can tell typed input from pasted input.
     bracketed_paste: bool,
+
+    /// Which mouse events (if any) the application has requested.
+    mouse_tracking: MouseTracking,
+    /// DEC private mode 1006: report mouse coordinates in the SGR extended
+    /// format (`ESC[<Cb;Cx;CyM`) instead of the legacy fixed-byte encoding,
+    /// which caps coordinates at 223.
+    mouse_sgr: bool,
 }
 
 impl TerminalGrid {
@@ -81,6 +108,8 @@ impl TerminalGrid {
             title: String::new(),
             bell: false,
             bracketed_paste: false,
+            mouse_tracking: MouseTracking::Off,
+            mouse_sgr: false,
         }
     }
 
@@ -331,5 +360,23 @@ impl TerminalGrid {
 
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    // ── Mouse tracking ───────────────────────────────────────────────────
+
+    pub fn set_mouse_tracking(&mut self, mode: MouseTracking) {
+        self.mouse_tracking = mode;
+    }
+
+    pub fn mouse_tracking(&self) -> MouseTracking {
+        self.mouse_tracking
+    }
+
+    pub fn set_mouse_sgr(&mut self, on: bool) {
+        self.mouse_sgr = on;
+    }
+
+    pub fn mouse_sgr(&self) -> bool {
+        self.mouse_sgr
     }
 }

@@ -5,7 +5,7 @@
 use vte::Params;
 
 use crate::cell::TermColor;
-use crate::grid::{EraseMode, TerminalGrid};
+use crate::grid::{EraseMode, MouseTracking, TerminalGrid};
 
 /// Bridges `vte`'s parser callbacks to [`TerminalGrid`] mutations.
 ///
@@ -105,8 +105,9 @@ impl GridHandler<'_> {
     }
 
     /// Handles CSI sequences with the `?` private-marker intermediate
-    /// (DEC private modes): `?1049h`/`?1049l` (alternate screen) and
-    /// `?2004h`/`?2004l` (bracketed paste).
+    /// (DEC private modes): `?1049h`/`?1049l` (alternate screen),
+    /// `?2004h`/`?2004l` (bracketed paste), `?9`/`?1000`/`?1002`/`?1003`
+    /// (mouse tracking mode), and `?1006` (SGR mouse coordinate encoding).
     fn private_mode_dispatch(&mut self, params: &Params, action: char) {
         let values = flatten_params(params);
         let set = match action {
@@ -123,8 +124,23 @@ impl GridHandler<'_> {
                 }
             }
             Some(2004) => self.grid.set_bracketed_paste(set),
+            Some(9) => self.set_mouse_tracking(set, MouseTracking::X10),
+            Some(1000) => self.set_mouse_tracking(set, MouseTracking::Normal),
+            Some(1002) => self.set_mouse_tracking(set, MouseTracking::ButtonEvent),
+            Some(1003) => self.set_mouse_tracking(set, MouseTracking::AnyEvent),
+            Some(1006) => self.grid.set_mouse_sgr(set),
             _ => {}
         }
+    }
+
+    /// Turns `mode` on or off. Disabling always resets tracking to `Off`
+    /// entirely (matching real terminals) rather than tracking each mode
+    /// bit independently — an application that layers modes (e.g. `?1000h`
+    /// then `?1002h` to upgrade from click to drag tracking) sends its own
+    /// `?1000h` again afterward if it wants both raised.
+    fn set_mouse_tracking(&mut self, set: bool, mode: MouseTracking) {
+        self.grid
+            .set_mouse_tracking(if set { mode } else { MouseTracking::Off });
     }
 }
 
@@ -223,6 +239,49 @@ mod tests {
 
         advance(&mut grid, b"\x1b[?2004l");
         assert!(!grid.bracketed_paste());
+    }
+
+    #[test]
+    fn mouse_tracking_modes_are_dispatched_by_private_mode_number() {
+        let cases: &[(&[u8], MouseTracking)] = &[
+            (b"\x1b[?9h", MouseTracking::X10),
+            (b"\x1b[?1000h", MouseTracking::Normal),
+            (b"\x1b[?1002h", MouseTracking::ButtonEvent),
+            (b"\x1b[?1003h", MouseTracking::AnyEvent),
+        ];
+        for (bytes, expected) in cases {
+            let mut grid = TerminalGrid::new(10, 20);
+            assert_eq!(grid.mouse_tracking(), MouseTracking::Off);
+            advance(&mut grid, bytes);
+            assert_eq!(grid.mouse_tracking(), *expected, "for {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn disabling_any_mouse_mode_resets_tracking_to_off() {
+        let mut grid = TerminalGrid::new(10, 20);
+        advance(&mut grid, b"\x1b[?1002h");
+        assert_eq!(grid.mouse_tracking(), MouseTracking::ButtonEvent);
+
+        advance(&mut grid, b"\x1b[?1002l");
+        assert_eq!(grid.mouse_tracking(), MouseTracking::Off);
+    }
+
+    #[test]
+    fn csi_1006_toggles_sgr_mouse_encoding_independent_of_tracking_mode() {
+        let mut grid = TerminalGrid::new(10, 20);
+        assert!(!grid.mouse_sgr());
+
+        advance(&mut grid, b"\x1b[?1006h");
+        assert!(grid.mouse_sgr());
+        assert_eq!(
+            grid.mouse_tracking(),
+            MouseTracking::Off,
+            "1006 only affects encoding, not whether tracking is on"
+        );
+
+        advance(&mut grid, b"\x1b[?1006l");
+        assert!(!grid.mouse_sgr());
     }
 
     #[test]

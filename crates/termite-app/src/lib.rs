@@ -11,7 +11,7 @@ use iced::futures::channel::mpsc as bridge;
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
-use iced::widget::{column, container, row, text, Stack};
+use iced::widget::{column, container, mouse_area, row, text, Stack};
 use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
 use secrecy::SecretString;
 
@@ -23,7 +23,7 @@ use termite_ssh::{
     SessionEvent, SshConfig, SshSession,
 };
 use termite_storage::{HostStore, KeyringStore, MemoryHostStore, TomlHostStore};
-use termite_terminal::{GridHandler, Pty, TerminalGrid};
+use termite_terminal::{GridHandler, MouseTracking, Pty, TerminalGrid};
 use termite_ui::{
     prompt, sidebar, tabbar, AuthKind, Prompt, PromptMessage, SidebarMessage, SidebarState,
     TabBarMessage, TabSummary,
@@ -61,6 +61,17 @@ const CHROME_HEIGHT_PX: f32 = 40.0;
 /// How long a bell's visual flash stays on before `Message::BellTimeout`
 /// clears it.
 const BELL_FLASH_DURATION: Duration = Duration::from_millis(200);
+
+/// xterm mouse-report button codes not covered by a real pressed button:
+/// the "no button" placeholder used for plain motion reports (`AnyEvent`
+/// tracking with nothing held), and the two wheel codes. Left/Middle/Right
+/// press codes are computed from `iced::mouse::Button` instead (see
+/// `mouse_button_code`) since they're already contiguous small integers.
+const MOUSE_NO_BUTTON: u8 = 3;
+const MOUSE_WHEEL_UP: u8 = 64;
+const MOUSE_WHEEL_DOWN: u8 = 65;
+/// Added to a button code to mark a motion report rather than a press.
+const MOUSE_MOTION_FLAG: u8 = 32;
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
@@ -162,6 +173,17 @@ pub struct TermiteApp {
     /// `grid_size_for_window`). Starts at the `ROWS`/`COLS` fallback until
     /// the first real window-size event arrives.
     grid_size: (usize, usize),
+    /// Last known cursor position within the terminal pane's `mouse_area`
+    /// (local to that widget, so no chrome offset needed — see `cell_at`).
+    /// `None` before the first `Message::MouseMoved`, or once the cursor
+    /// has left the area. Presses/releases/scrolls read this rather than
+    /// carrying their own position, since Iced's `MouseArea` doesn't hand
+    /// one to `on_press`/`on_release`/`on_scroll` (see `view`).
+    mouse_position: Option<iced::Point>,
+    /// The button currently held down over the terminal pane, if any —
+    /// needed to pick the right code for a motion report under
+    /// `MouseTracking::ButtonEvent` (see `report_mouse_event`).
+    mouse_button_down: Option<iced::mouse::Button>,
 
     // ── M4: host management ──────────────────────────────────────────
     host_store: Arc<dyn HostStore>,
@@ -224,6 +246,8 @@ impl TermiteApp {
             tabs: vec![tab],
             active_tab,
             grid_size: (ROWS, COLS),
+            mouse_position: None,
+            mouse_button_down: None,
             host_store: make_host_store(),
             hosts: Vec::new(),
             sidebar: SidebarState::default(),
@@ -530,6 +554,15 @@ pub enum Message {
     /// The system clipboard was read in response to a paste shortcut;
     /// `None` if the clipboard was empty or unreadable.
     Pasted(Option<String>),
+    /// The cursor moved within the terminal pane, at this position local to
+    /// the pane's `mouse_area`.
+    MouseMoved(iced::Point),
+    /// A mouse button went down over the terminal pane.
+    MousePress(iced::mouse::Button),
+    /// A mouse button was released over the terminal pane.
+    MouseRelease(iced::mouse::Button),
+    /// The wheel was scrolled over the terminal pane.
+    MouseScrolled(iced::mouse::ScrollDelta),
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -631,6 +664,36 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
         }
         Message::Pasted(Some(text)) => paste_into_active_tab(app, &text),
         Message::Pasted(None) => {}
+        Message::MouseMoved(point) => {
+            app.mouse_position = Some(point);
+            report_mouse_event(app, point, MouseReportKind::Motion);
+        }
+        Message::MousePress(button) => {
+            app.mouse_button_down = Some(button);
+            if let Some(point) = app.mouse_position {
+                report_mouse_event(app, point, MouseReportKind::Press(button));
+            }
+        }
+        Message::MouseRelease(button) => {
+            app.mouse_button_down = None;
+            if let Some(point) = app.mouse_position {
+                report_mouse_event(app, point, MouseReportKind::Release(button));
+            }
+        }
+        Message::MouseScrolled(delta) => {
+            if let Some(point) = app.mouse_position {
+                let y = match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. }
+                    | iced::mouse::ScrollDelta::Pixels { y, .. } => y,
+                };
+                let kind = if y > 0.0 {
+                    MouseReportKind::WheelUp
+                } else {
+                    MouseReportKind::WheelDown
+                };
+                report_mouse_event(app, point, kind);
+            }
+        }
     }
     Task::none()
 }
@@ -718,6 +781,136 @@ fn paste_into_active_tab(app: &mut TermiteApp, text: &str) {
     if bracketed {
         bytes.extend_from_slice(b"\x1b[201~");
     }
+
+    let ssh_target = match &mut tab.kind {
+        TabKind::Local { writer, .. } => {
+            let _ = writer.write_all(&bytes);
+            None
+        }
+        TabKind::Ssh { session_id, .. } => *session_id,
+    };
+    if let Some(id) = ssh_target {
+        send_to_session(app, id, SessionCommand::Write(bytes));
+    }
+}
+
+// ── Mouse reporting (xterm mouse protocol) ─────────────────────────────────────
+
+/// What happened, before it's turned into an xterm mouse-report code.
+#[derive(Debug, Clone, Copy)]
+enum MouseReportKind {
+    Press(iced::mouse::Button),
+    Release(iced::mouse::Button),
+    /// Cursor moved; which (if any) button was held is read from
+    /// `TermiteApp::mouse_button_down` by `report_mouse_event` rather than
+    /// carried here, since it's app state, not part of the move event
+    /// itself.
+    Motion,
+    WheelUp,
+    WheelDown,
+}
+
+/// Maps a left/middle/right button to its xterm base code. Back/Forward
+/// (and any future variants) have no xterm equivalent and are dropped —
+/// `report_mouse_event` treats that as "nothing to report".
+fn mouse_button_code(button: iced::mouse::Button) -> Option<u8> {
+    match button {
+        iced::mouse::Button::Left => Some(0),
+        iced::mouse::Button::Middle => Some(1),
+        iced::mouse::Button::Right => Some(2),
+        _ => None,
+    }
+}
+
+/// Converts a pane-local pixel position into a 1-indexed (col, row) cell,
+/// clamped to the grid's current bounds. Uses the same approximate cell
+/// metrics as `grid_size_for_window` — see that function's doc comment for
+/// why they're not measured against the real font.
+fn cell_at(point: iced::Point, rows: usize, cols: usize) -> (usize, usize) {
+    let col = (point.x / CELL_WIDTH_PX).floor() as isize + 1;
+    let row = (point.y / CELL_HEIGHT_PX).floor() as isize + 1;
+    (
+        col.clamp(1, cols as isize) as usize,
+        row.clamp(1, rows as isize) as usize,
+    )
+}
+
+/// Encodes one mouse report. `code` is the xterm base button code (0/1/2
+/// for left/middle/right, `MOUSE_NO_BUTTON` for a buttonless motion report,
+/// `MOUSE_WHEEL_UP`/`MOUSE_WHEEL_DOWN` for the wheel, with
+/// `MOUSE_MOTION_FLAG` already added by the caller for a motion report).
+/// `col`/`row` are 1-indexed.
+///
+/// SGR mode (`?1006`) reports `ESC[<code;col;rowM` for a press/motion and
+/// `...m` for a release, with no coordinate limit. Legacy mode reports the
+/// fixed 6-byte `ESC[M CbCxCy` form, everything offset by 32 to stay
+/// printable — which caps any reportable coordinate at 223 (255 - 32) and
+/// can't distinguish *which* button was released, only that one was (code
+/// `MOUSE_NO_BUTTON`), so `release` is ignored for `code`'s value there and
+/// only changes which fixed code legacy mode sends.
+fn encode_mouse_event(code: u8, release: bool, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+    if sgr {
+        let mut out = format!("\x1b[<{code};{col};{row}").into_bytes();
+        out.push(if release { b'm' } else { b'M' });
+        out
+    } else {
+        let clamp_coord = |v: usize| (v.min(223) as u8) + 32;
+        let cb = if release { MOUSE_NO_BUTTON } else { code };
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            cb + 32,
+            clamp_coord(col),
+            clamp_coord(row),
+        ]
+    }
+}
+
+/// Reports a mouse event to the active tab's session, if its grid currently
+/// has mouse tracking enabled and (for a motion report) the active tracking
+/// mode actually covers this kind of motion. A no-op otherwise — including
+/// when there's no active tab, or the event is a press/release of a button
+/// xterm has no code for (`mouse_button_code` returns `None`).
+fn report_mouse_event(app: &mut TermiteApp, point: iced::Point, kind: MouseReportKind) {
+    let held = app.mouse_button_down;
+    let Some(tab) = app.active_tab_mut() else {
+        return;
+    };
+    let tracking = tab.grid.mouse_tracking();
+    if tracking == MouseTracking::Off {
+        return;
+    }
+    if matches!(kind, MouseReportKind::Motion) {
+        let covered = matches!(tracking, MouseTracking::AnyEvent)
+            || (matches!(tracking, MouseTracking::ButtonEvent) && held.is_some());
+        if !covered {
+            return;
+        }
+    }
+
+    let sgr = tab.grid.mouse_sgr();
+    let (col, row) = cell_at(point, tab.grid.rows(), tab.grid.cols());
+    let bytes = match kind {
+        MouseReportKind::Press(button) => {
+            mouse_button_code(button).map(|code| encode_mouse_event(code, false, col, row, sgr))
+        }
+        MouseReportKind::Release(button) => {
+            mouse_button_code(button).map(|code| encode_mouse_event(code, true, col, row, sgr))
+        }
+        MouseReportKind::Motion => {
+            let code =
+                held.and_then(mouse_button_code).unwrap_or(MOUSE_NO_BUTTON) + MOUSE_MOTION_FLAG;
+            Some(encode_mouse_event(code, false, col, row, sgr))
+        }
+        MouseReportKind::WheelUp => Some(encode_mouse_event(MOUSE_WHEEL_UP, false, col, row, sgr)),
+        MouseReportKind::WheelDown => {
+            Some(encode_mouse_event(MOUSE_WHEEL_DOWN, false, col, row, sgr))
+        }
+    };
+    let Some(bytes) = bytes else {
+        return;
+    };
 
     let ssh_target = match &mut tab.kind {
         TabKind::Local { writer, .. } => {
@@ -1677,6 +1870,15 @@ fn view(app: &TermiteApp) -> Element<'_, Message> {
             container::Style::default()
         }
     });
+    let terminal = mouse_area(terminal)
+        .on_press(Message::MousePress(iced::mouse::Button::Left))
+        .on_release(Message::MouseRelease(iced::mouse::Button::Left))
+        .on_right_press(Message::MousePress(iced::mouse::Button::Right))
+        .on_right_release(Message::MouseRelease(iced::mouse::Button::Right))
+        .on_middle_press(Message::MousePress(iced::mouse::Button::Middle))
+        .on_middle_release(Message::MouseRelease(iced::mouse::Button::Middle))
+        .on_move(Message::MouseMoved)
+        .on_scroll(Message::MouseScrolled);
 
     let pane = column![tab_bar, terminal].width(Length::Fill);
 
@@ -3106,6 +3308,177 @@ mod tests {
                 assert_eq!(bytes, b"hello".to_vec());
             }
             other => panic!("expected an unwrapped Write command, got {other:?}"),
+        }
+    }
+
+    // ── M6: mouse reporting ─────────────────────────────────────────────────
+
+    #[test]
+    fn cell_at_converts_pixels_to_1_indexed_cells_and_clamps_to_grid_bounds() {
+        let origin = iced::Point::new(0.0, 0.0);
+        assert_eq!(cell_at(origin, 24, 80), (1, 1));
+
+        let mid = iced::Point::new(CELL_WIDTH_PX * 4.5, CELL_HEIGHT_PX * 2.5);
+        assert_eq!(cell_at(mid, 24, 80), (5, 3));
+
+        let past_the_edge = iced::Point::new(CELL_WIDTH_PX * 1000.0, CELL_HEIGHT_PX * 1000.0);
+        assert_eq!(
+            cell_at(past_the_edge, 24, 80),
+            (80, 24),
+            "should clamp to the grid's own bounds, not report an out-of-range cell"
+        );
+    }
+
+    #[test]
+    fn encode_mouse_event_sgr_uses_the_m_case_to_distinguish_press_from_release() {
+        assert_eq!(
+            encode_mouse_event(0, false, 5, 3, true),
+            b"\x1b[<0;5;3M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse_event(0, true, 5, 3, true),
+            b"\x1b[<0;5;3m".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_mouse_event_legacy_offsets_by_32_and_cant_name_the_released_button() {
+        // Left press (code 0) at col 1, row 1: CSI M, then (0+32), (1+32), (1+32).
+        assert_eq!(
+            encode_mouse_event(0, false, 1, 1, false),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // Any release becomes the fixed "no button" code, not the pressed button's code.
+        assert_eq!(
+            encode_mouse_event(0, true, 1, 1, false),
+            vec![0x1b, b'[', b'M', MOUSE_NO_BUTTON + 32, 33, 33]
+        );
+    }
+
+    #[test]
+    fn encode_mouse_event_legacy_clamps_coordinates_at_223() {
+        let bytes = encode_mouse_event(0, false, 9999, 9999, false);
+        assert_eq!(bytes[4], 223 + 32);
+        assert_eq!(bytes[5], 223 + 32);
+    }
+
+    /// Sets up an SSH tab as the active tab with `mode`/`sgr` mouse tracking
+    /// already enabled on its grid, and a fake worker channel to inspect
+    /// what gets sent.
+    fn tab_with_mouse_tracking(
+        mode: MouseTracking,
+        sgr: bool,
+    ) -> (TermiteApp, bridge::Receiver<SshWorkerInput>, SessionId) {
+        let mut app = test_app();
+        let rx = wire_fake_worker(&mut app);
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+        let tab = app.find_tab_mut(tab_id).unwrap();
+        tab.grid.set_mouse_tracking(mode);
+        tab.grid.set_mouse_sgr(sgr);
+        (app, rx, session_id)
+    }
+
+    #[test]
+    fn mouse_press_and_release_report_under_normal_tracking() {
+        let (mut app, mut rx, session_id) = tab_with_mouse_tracking(MouseTracking::Normal, true);
+        let point = iced::Point::new(0.0, 0.0);
+
+        let _ = update(&mut app, Message::MouseMoved(point));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(id, SessionCommand::Write(bytes))) => {
+                assert_eq!(id, session_id);
+                assert_eq!(bytes, b"\x1b[<0;1;1M".to_vec());
+            }
+            other => panic!("expected a press report, got {other:?}"),
+        }
+
+        let _ = update(&mut app, Message::MouseRelease(iced::mouse::Button::Left));
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(id, SessionCommand::Write(bytes))) => {
+                assert_eq!(id, session_id);
+                assert_eq!(bytes, b"\x1b[<0;1;1m".to_vec());
+            }
+            other => panic!("expected a release report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_events_are_a_no_op_when_tracking_is_off() {
+        let (mut app, mut rx, _session_id) = tab_with_mouse_tracking(MouseTracking::Off, true);
+
+        let _ = update(&mut app, Message::MouseMoved(iced::Point::new(0.0, 0.0)));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+        let _ = update(&mut app, Message::MouseRelease(iced::mouse::Button::Left));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no mouse report should be sent while tracking is off"
+        );
+    }
+
+    #[test]
+    fn plain_motion_is_only_reported_under_any_event_tracking() {
+        let point = iced::Point::new(0.0, 0.0);
+
+        let (mut app, mut rx, _) = tab_with_mouse_tracking(MouseTracking::ButtonEvent, true);
+        let _ = update(&mut app, Message::MouseMoved(point));
+        assert!(
+            rx.try_recv().is_err(),
+            "ButtonEvent tracking shouldn't report motion with no button held"
+        );
+
+        let (mut app, mut rx, _) = tab_with_mouse_tracking(MouseTracking::AnyEvent, true);
+        let _ = update(&mut app, Message::MouseMoved(point));
+        assert!(
+            rx.try_recv().is_ok(),
+            "AnyEvent tracking should report plain motion"
+        );
+    }
+
+    #[test]
+    fn drag_motion_is_reported_under_button_event_tracking() {
+        let (mut app, mut rx, _) = tab_with_mouse_tracking(MouseTracking::ButtonEvent, true);
+        let point = iced::Point::new(0.0, 0.0);
+
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+        while rx.try_recv().is_ok() {}
+        let _ = update(&mut app, Message::MouseMoved(point));
+
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(_, SessionCommand::Write(bytes))) => {
+                assert_eq!(bytes, b"\x1b[<32;1;1M".to_vec(), "0 (left) + 32 (motion)");
+            }
+            other => panic!("expected a drag-motion report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wheel_scroll_reports_up_or_down_by_sign() {
+        let (mut app, mut rx, _) = tab_with_mouse_tracking(MouseTracking::Normal, true);
+        let _ = update(&mut app, Message::MouseMoved(iced::Point::new(0.0, 0.0)));
+
+        let _ = update(
+            &mut app,
+            Message::MouseScrolled(iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }),
+        );
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(_, SessionCommand::Write(bytes))) => {
+                assert_eq!(bytes, b"\x1b[<64;1;1M".to_vec(), "wheel up");
+            }
+            other => panic!("expected a wheel-up report, got {other:?}"),
+        }
+
+        let _ = update(
+            &mut app,
+            Message::MouseScrolled(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+        );
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(_, SessionCommand::Write(bytes))) => {
+                assert_eq!(bytes, b"\x1b[<65;1;1M".to_vec(), "wheel down");
+            }
+            other => panic!("expected a wheel-down report, got {other:?}"),
         }
     }
 }

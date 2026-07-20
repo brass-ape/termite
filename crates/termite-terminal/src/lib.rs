@@ -15,6 +15,6 @@ pub mod handler;
 pub mod pty;
 
 pub use cell::{Attrs, Cell, TermColor};
-pub use grid::{EraseMode, TerminalGrid};
+pub use grid::{EraseMode, MouseTracking, TerminalGrid};
 pub use handler::GridHandler;
 pub use pty::{Pty, PtyError};
