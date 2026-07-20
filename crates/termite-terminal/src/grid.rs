@@ -51,6 +51,15 @@ pub struct TerminalGrid {
     pending_attrs: Attrs,
 
     title: String,
+
+    /// Set by a BEL (`0x07`) byte, cleared by [`TerminalGrid::take_bell`].
+    /// The grid only records that a bell rang; timing any visual flash is
+    /// the UI layer's job.
+    bell: bool,
+    /// DEC private mode 2004 (CSI `?2004h`/`?2004l`): whether pasted text
+    /// should be wrapped in `ESC[200~`/`ESC[201~` before being sent to the
+    /// shell, so a pasting app can tell typed input from pasted input.
+    bracketed_paste: bool,
 }
 
 impl TerminalGrid {
@@ -70,6 +79,8 @@ impl TerminalGrid {
             pending_bg: TermColor::Default,
             pending_attrs: Attrs::default(),
             title: String::new(),
+            bell: false,
+            bracketed_paste: false,
         }
     }
 
@@ -298,5 +309,27 @@ impl TerminalGrid {
 
     pub fn leave_alt_screen(&mut self) {
         self.on_alt_screen = false;
+    }
+
+    // ── Bell / bracketed paste ───────────────────────────────────────────
+
+    /// Records that a BEL byte was seen. Call [`Self::take_bell`] to
+    /// consume it.
+    pub fn ring_bell(&mut self) {
+        self.bell = true;
+    }
+
+    /// Returns whether a bell has rung since the last call, clearing the
+    /// flag.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell)
+    }
+
+    pub fn set_bracketed_paste(&mut self, on: bool) {
+        self.bracketed_paste = on;
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 }

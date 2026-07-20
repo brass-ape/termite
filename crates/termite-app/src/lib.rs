@@ -11,7 +11,7 @@ use iced::futures::channel::mpsc as bridge;
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
-use iced::widget::{column, row, text, Stack};
+use iced::widget::{column, container, row, text, Stack};
 use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
 use secrecy::SecretString;
 
@@ -29,7 +29,10 @@ use termite_ui::{
     TabBarMessage, TabSummary,
 };
 
-/// Default grid size until real window-size-driven resizing lands (M6).
+/// Grid size before the first `Message::WindowResized` arrives (Iced has no
+/// synchronous "give me the current window size" call at startup — see
+/// `grid_size_for_window`, which takes over from here once the window
+/// reports its real size).
 const ROWS: usize = 30;
 const COLS: usize = 100;
 
@@ -41,6 +44,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// before it's left `Disconnected` for the user to retry manually.
 const MAX_RECONNECT_ATTEMPTS: u32 = 6;
 
+/// Approximate cell metrics for `Font::MONOSPACE` at the terminal's text
+/// size (14, see `view`), used to translate a window resize in pixels into
+/// a row/column count. Not measured against the actual font — Iced has no
+/// synchronous glyph-metrics query available at this layer — so this is a
+/// deliberate approximation, not pixel-perfect; see `grid_size_for_window`.
+const CELL_WIDTH_PX: f32 = 8.4;
+const CELL_HEIGHT_PX: f32 = 18.0;
+
+/// Fixed chrome the terminal pane doesn't get to draw into: the sidebar's
+/// width (`sidebar::view`'s `Length::Fixed(220.0)`) and an estimate of the
+/// tab bar's height.
+const SIDEBAR_WIDTH_PX: f32 = 220.0;
+const CHROME_HEIGHT_PX: f32 = 40.0;
+
+/// How long a bell's visual flash stays on before `Message::BellTimeout`
+/// clears it.
+const BELL_FLASH_DURATION: Duration = Duration::from_millis(200);
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 /// What a tab's byte source is. A local tab owns its own PTY end-to-end; an
@@ -50,8 +71,9 @@ enum TabKind {
     Local {
         writer: Box<dyn Write + Send>,
         output: Arc<Mutex<Vec<u8>>>,
-        /// Kept alive so the pty and child shell aren't torn down.
-        _pty: Pty,
+        /// Kept alive so the pty and child shell aren't torn down; also the
+        /// target of a window resize (see `resize_all_tabs`).
+        pty: Pty,
     },
     Ssh {
         /// `None` between the tab being created and the `SessionSpawned`
@@ -82,28 +104,42 @@ struct Tab {
     parser: vte::Parser,
     kind: TabKind,
     status: ConnectionStatus,
+    /// Whether this tab's bell flash is currently showing (see
+    /// `Message::BellTimeout`). Purely a UI-timing concern, so it lives on
+    /// `Tab` rather than `TerminalGrid`, which only records that a bell
+    /// happened (`TerminalGrid::take_bell`).
+    bell_flash: bool,
 }
 
 impl Tab {
-    fn new(title: impl Into<String>, kind: TabKind, status: ConnectionStatus) -> Self {
+    fn new(
+        title: impl Into<String>,
+        kind: TabKind,
+        status: ConnectionStatus,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
         Self {
             id: TabId::new(),
             title: title.into(),
-            grid: TerminalGrid::new(ROWS, COLS),
+            grid: TerminalGrid::new(rows, cols),
             parser: vte::Parser::new(),
             kind,
             status,
+            bell_flash: false,
         }
     }
 
     /// Feeds raw bytes through this tab's own VT parser into its own grid.
-    fn advance(&mut self, bytes: &[u8]) {
+    /// Returns whether a bell rang while processing them.
+    fn advance(&mut self, bytes: &[u8]) -> bool {
         let mut handler = GridHandler {
             grid: &mut self.grid,
         };
         for &byte in bytes {
             self.parser.advance(&mut handler, byte);
         }
+        self.grid.take_bell()
     }
 }
 
@@ -121,6 +157,11 @@ pub struct TermiteApp {
     /// Only `None` in the brief window during `new()` before the first tab
     /// is pushed.
     active_tab: Option<TabId>,
+    /// The row/column size every tab is currently created and kept sized
+    /// to, kept up to date by `Message::WindowResized` (see
+    /// `grid_size_for_window`). Starts at the `ROWS`/`COLS` fallback until
+    /// the first real window-size event arrives.
+    grid_size: (usize, usize),
 
     // ── M4: host management ──────────────────────────────────────────
     host_store: Arc<dyn HostStore>,
@@ -176,12 +217,13 @@ impl PendingPrompt {
 
 impl TermiteApp {
     fn new() -> Result<Self, termite_terminal::PtyError> {
-        let tab = spawn_local_tab()?;
+        let tab = spawn_local_tab(ROWS, COLS)?;
         let active_tab = Some(tab.id);
 
         Ok(Self {
             tabs: vec![tab],
             active_tab,
+            grid_size: (ROWS, COLS),
             host_store: make_host_store(),
             hosts: Vec::new(),
             sidebar: SidebarState::default(),
@@ -217,10 +259,12 @@ impl TermiteApp {
 
 /// Spawns a new local shell PTY, its background reader thread, and wraps
 /// them into a fresh [`Tab`]. Used both for the app's initial tab and for
-/// `Message::NewLocalTab`.
-fn spawn_local_tab() -> Result<Tab, termite_terminal::PtyError> {
+/// `Message::NewLocalTab`; sized to `rows`/`cols` (the app's current
+/// `grid_size`, so a new tab matches whatever size the window has already
+/// settled on).
+fn spawn_local_tab(rows: usize, cols: usize) -> Result<Tab, termite_terminal::PtyError> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let pty = Pty::spawn(&shell, ROWS as u16, COLS as u16)?;
+    let pty = Pty::spawn(&shell, rows as u16, cols as u16)?;
 
     let mut reader = pty.try_clone_reader()?;
     let writer = pty.take_writer()?;
@@ -247,9 +291,11 @@ fn spawn_local_tab() -> Result<Tab, termite_terminal::PtyError> {
         TabKind::Local {
             writer,
             output,
-            _pty: pty,
+            pty,
         },
         ConnectionStatus::Connected,
+        rows,
+        cols,
     ))
 }
 
@@ -267,7 +313,8 @@ fn advance_active(app: &mut TermiteApp, bytes: &[u8]) {
 /// active. A spawn failure is logged and otherwise ignored — the app
 /// already has at least one tab open, so there's nothing to fail closed.
 fn new_local_tab(app: &mut TermiteApp) {
-    match spawn_local_tab() {
+    let (rows, cols) = app.grid_size;
+    match spawn_local_tab(rows, cols) {
         Ok(tab) => {
             app.active_tab = Some(tab.id);
             app.tabs.push(tab);
@@ -472,6 +519,17 @@ pub enum Message {
     NewLocalTab,
     /// Interaction with the tab bar.
     TabBar(TabBarMessage),
+
+    // ── M6: advanced terminal features ────────────────────────────────
+    /// The window was resized; carries its new size in pixels (see
+    /// `grid_size_for_window`).
+    WindowResized(iced::Size),
+    /// A tab's bell-flash display window (`BELL_FLASH_DURATION`) elapsed.
+    /// No-op if the tab was closed in the meantime.
+    BellTimeout(TabId),
+    /// The system clipboard was read in response to a paste shortcut;
+    /// `None` if the clipboard was empty or unreadable.
+    Pasted(Option<String>),
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -497,6 +555,7 @@ fn initialize() -> (TermiteApp, Task<Message>) {
 fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
     match message {
         Message::PollOutput => {
+            let mut rung = Vec::new();
             for tab in &mut app.tabs {
                 let bytes = match &tab.kind {
                     TabKind::Local { output, .. } => match output.lock() {
@@ -505,12 +564,19 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
                     },
                     TabKind::Ssh { .. } => Vec::new(),
                 };
-                if !bytes.is_empty() {
-                    tab.advance(&bytes);
+                if !bytes.is_empty() && tab.advance(&bytes) {
+                    tab.bell_flash = true;
+                    rung.push(tab.id);
                 }
+            }
+            if !rung.is_empty() {
+                return Task::batch(rung.into_iter().map(bell_timeout_task));
             }
         }
         Message::KeyPressed { key, modifiers } => {
+            if is_paste_shortcut(&key, modifiers) {
+                return iced::clipboard::read().map(Message::Pasted);
+            }
             if let Some(task) = handle_tab_shortcut(app, &key, modifiers) {
                 return task;
             }
@@ -553,8 +619,116 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
         Message::AttemptReconnect(tab_id) => return reconnect(app, tab_id),
         Message::NewLocalTab => new_local_tab(app),
         Message::TabBar(message) => return update_tabbar(app, message),
+        Message::WindowResized(size) => {
+            let (rows, cols) = grid_size_for_window(size);
+            app.grid_size = (rows, cols);
+            resize_all_tabs(app, rows, cols);
+        }
+        Message::BellTimeout(tab_id) => {
+            if let Some(tab) = app.find_tab_mut(tab_id) {
+                tab.bell_flash = false;
+            }
+        }
+        Message::Pasted(Some(text)) => paste_into_active_tab(app, &text),
+        Message::Pasted(None) => {}
     }
     Task::none()
+}
+
+/// Translates a window size in pixels into a row/column grid size, using
+/// the approximate cell metrics and fixed chrome sizes defined above.
+/// Always at least 1x1, so a tiny or not-yet-laid-out window can't produce
+/// a zero-size grid.
+fn grid_size_for_window(size: iced::Size) -> (usize, usize) {
+    let cols = ((size.width - SIDEBAR_WIDTH_PX) / CELL_WIDTH_PX).floor();
+    let rows = ((size.height - CHROME_HEIGHT_PX) / CELL_HEIGHT_PX).floor();
+    (rows.max(1.0) as usize, cols.max(1.0) as usize)
+}
+
+/// Resizes every open tab's grid to `rows`/`cols` and propagates the new
+/// size to whatever's feeding it: the local pty, or (for a live SSH tab) a
+/// `SessionCommand::Resize` forwarded to the remote pty.
+fn resize_all_tabs(app: &mut TermiteApp, rows: usize, cols: usize) {
+    let mut ssh_targets = Vec::new();
+    for tab in &mut app.tabs {
+        tab.grid.resize(rows, cols);
+        match &tab.kind {
+            TabKind::Local { pty, .. } => {
+                if let Err(err) = pty.resize(rows as u16, cols as u16) {
+                    tracing::warn!(%err, "failed to resize local pty");
+                }
+            }
+            TabKind::Ssh { session_id, .. } => {
+                if let Some(id) = session_id {
+                    ssh_targets.push(*id);
+                }
+            }
+        }
+    }
+    for id in ssh_targets {
+        send_to_session(
+            app,
+            id,
+            SessionCommand::Resize {
+                rows: rows as u16,
+                cols: cols as u16,
+            },
+        );
+    }
+}
+
+/// Schedules `Message::BellTimeout(tab_id)` after `BELL_FLASH_DURATION`.
+/// `sleep` is constructed inside the async block (not passed directly to
+/// `Task::perform`) so it isn't registered with the Tokio timer driver
+/// until the future is actually polled by a real runtime — see v14's
+/// reconnect-backoff note in `HANDOFF.md` for why the eager form panics
+/// under a plain `#[test]`.
+fn bell_timeout_task(tab_id: TabId) -> Task<Message> {
+    Task::perform(
+        async move { tokio::time::sleep(BELL_FLASH_DURATION).await },
+        move |_| Message::BellTimeout(tab_id),
+    )
+}
+
+/// Whether this key press is the paste shortcut (`Ctrl+Shift+V`). Plain
+/// `Ctrl+V` is deliberately left alone — in `key_to_bytes` it already
+/// forwards as the control byte `0x16`, which readline and friends treat as
+/// "quoted insert"; claiming it for paste would be a behavior regression
+/// the way claiming `Ctrl+Tab`/`Ctrl+<digit>` for tab navigation wasn't
+/// (see `handle_tab_shortcut`).
+fn is_paste_shortcut(key: &Key, modifiers: Modifiers) -> bool {
+    modifiers.control()
+        && modifiers.shift()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+}
+
+/// Sends pasted clipboard text to the active tab, wrapped in
+/// `ESC[200~`/`ESC[201~` if the tab's grid has bracketed paste mode
+/// enabled (DEC private mode 2004). A no-op if there's no active tab.
+fn paste_into_active_tab(app: &mut TermiteApp, text: &str) {
+    let Some(tab) = app.active_tab_mut() else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    let bracketed = tab.grid.bracketed_paste();
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+
+    let ssh_target = match &mut tab.kind {
+        TabKind::Local { writer, .. } => {
+            let _ = writer.write_all(&bytes);
+            None
+        }
+        TabKind::Ssh { session_id, .. } => *session_id,
+    };
+    if let Some(id) = ssh_target {
+        send_to_session(app, id, SessionCommand::Write(bytes));
+    }
 }
 
 /// Handles interaction with the tab bar.
@@ -736,7 +910,10 @@ fn handle_session_event(app: &mut TermiteApp, id: SessionId, event: SessionEvent
         }
         SessionEvent::Output(bytes) => {
             if let Some(tab) = app.find_tab_by_session_mut(id) {
-                tab.advance(&bytes);
+                if tab.advance(&bytes) {
+                    tab.bell_flash = true;
+                    return bell_timeout_task(tab.id);
+                }
             }
         }
         SessionEvent::AuthRequired(challenge) => {
@@ -1343,6 +1520,7 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
         }
         SidebarMessage::SelectHost(id) => {
             if let Some(mut profile) = app.hosts.iter().find(|host| host.id == id).cloned() {
+                let (rows, cols) = app.grid_size;
                 let tab = Tab::new(
                     profile.name.clone(),
                     TabKind::Ssh {
@@ -1351,6 +1529,8 @@ fn update_sidebar(app: &mut TermiteApp, message: SidebarMessage) -> Task<Message
                         reconnect_attempt: 0,
                     },
                     ConnectionStatus::Connecting,
+                    rows,
+                    cols,
                 );
                 let tab_id = tab.id;
                 app.tabs.push(tab);
@@ -1478,10 +1658,25 @@ fn view(app: &TermiteApp) -> Element<'_, Message> {
         .active_tab()
         .map(|tab| tab.grid.visible_rows().join("\n"))
         .unwrap_or_default();
+    let bell_flash = app.active_tab().is_some_and(|tab| tab.bell_flash);
     let terminal = text(rows)
         .font(Font::MONOSPACE)
         .size(14)
         .width(Length::Fill);
+    let terminal = container(terminal).style(move |_theme| {
+        if bell_flash {
+            container::Style {
+                border: iced::Border {
+                    color: termite_ui::theme::colours::ACCENT,
+                    width: 2.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            }
+        } else {
+            container::Style::default()
+        }
+    });
 
     let pane = column![tab_bar, terminal].width(Length::Fill);
 
@@ -1500,6 +1695,7 @@ fn subscription(_app: &TermiteApp) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(POLL_INTERVAL).map(|_| Message::PollOutput),
         iced::keyboard::on_key_press(|key, modifiers| Some(Message::KeyPressed { key, modifiers })),
+        iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
         Subscription::run(ssh_worker),
     ])
 }
@@ -2530,6 +2726,8 @@ mod tests {
                 reconnect_attempt: 0,
             },
             ConnectionStatus::Connected,
+            ROWS,
+            COLS,
         );
         let id = tab.id;
         app.tabs.push(tab);
@@ -2767,5 +2965,147 @@ mod tests {
         let task = handle_tab_shortcut(&mut app, &Key::Named(Named::Tab), Modifiers::empty());
 
         assert!(task.is_none());
+    }
+
+    // ── M6: advanced terminal features ────────────────────────────────────
+
+    /// `+ 0.5` cells of slack on each dimension so the assertion is robust
+    /// to `f32` rounding in the pixels-to-cells division — `floor` still
+    /// lands on the intended integer either way.
+    fn window_size_for(cols: usize, rows: usize) -> iced::Size {
+        iced::Size::new(
+            SIDEBAR_WIDTH_PX + CELL_WIDTH_PX * (cols as f32 + 0.5),
+            CHROME_HEIGHT_PX + CELL_HEIGHT_PX * (rows as f32 + 0.5),
+        )
+    }
+
+    #[test]
+    fn grid_size_for_window_computes_rows_and_cols_from_pixels() {
+        assert_eq!(grid_size_for_window(window_size_for(80, 24)), (24, 80));
+    }
+
+    #[test]
+    fn grid_size_for_window_clamps_to_at_least_one_by_one() {
+        assert_eq!(grid_size_for_window(iced::Size::new(10.0, 10.0)), (1, 1));
+    }
+
+    #[test]
+    fn window_resized_updates_grid_size_and_resizes_open_tabs() {
+        let mut app = test_app();
+
+        let _ = update(&mut app, Message::WindowResized(window_size_for(50, 20)));
+
+        assert_eq!(app.grid_size, (20, 50));
+        let tab = app.active_tab().expect("an active tab");
+        assert_eq!((tab.grid.rows(), tab.grid.cols()), (20, 50));
+    }
+
+    #[test]
+    fn new_local_tab_after_resize_matches_the_new_size() {
+        let mut app = test_app();
+        let _ = update(&mut app, Message::WindowResized(window_size_for(40, 15)));
+
+        let _ = update(&mut app, Message::NewLocalTab);
+
+        let tab = app.active_tab().expect("an active tab");
+        assert_eq!((tab.grid.rows(), tab.grid.cols()), (15, 40));
+    }
+
+    #[test]
+    fn ssh_tab_resize_sends_a_resize_command() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let session_id = SessionId::new();
+        push_ssh_tab(&mut app, Some(session_id));
+
+        let _ = update(&mut app, Message::WindowResized(window_size_for(60, 30)));
+
+        let mut saw_resize = false;
+        while let Ok(input) = rx.try_recv() {
+            if let SshWorkerInput::Send(id, SessionCommand::Resize { rows, cols }) = input {
+                assert_eq!(id, session_id);
+                assert_eq!((rows, cols), (30, 60));
+                saw_resize = true;
+            }
+        }
+        assert!(saw_resize, "expected a Resize command for the ssh tab");
+    }
+
+    #[test]
+    fn bell_byte_sets_flash_and_bell_timeout_clears_it() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+
+        let _ = handle_session_event(&mut app, session_id, SessionEvent::Output(vec![0x07]));
+        assert!(app.find_tab(tab_id).unwrap().bell_flash);
+
+        let _ = update(&mut app, Message::BellTimeout(tab_id));
+        assert!(!app.find_tab(tab_id).unwrap().bell_flash);
+
+        while rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn bell_timeout_for_a_closed_tab_is_a_no_op() {
+        let mut app = test_app();
+        let closed_tab_id = TabId::new();
+
+        let _ = update(&mut app, Message::BellTimeout(closed_tab_id));
+
+        assert!(app.find_tab(closed_tab_id).is_none());
+    }
+
+    #[test]
+    fn is_paste_shortcut_requires_ctrl_shift_v() {
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(is_paste_shortcut(&Key::Character("v".into()), ctrl_shift));
+        assert!(is_paste_shortcut(&Key::Character("V".into()), ctrl_shift));
+        assert!(!is_paste_shortcut(
+            &Key::Character("v".into()),
+            Modifiers::CTRL
+        ));
+        assert!(!is_paste_shortcut(&Key::Character("a".into()), ctrl_shift));
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_pasted_text_for_an_ssh_tab() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let session_id = SessionId::new();
+        let tab_id = push_ssh_tab(&mut app, Some(session_id));
+        app.find_tab_mut(tab_id)
+            .unwrap()
+            .grid
+            .set_bracketed_paste(true);
+
+        paste_into_active_tab(&mut app, "hello");
+
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(id, SessionCommand::Write(bytes))) => {
+                assert_eq!(id, session_id);
+                assert_eq!(bytes, b"\x1b[200~hello\x1b[201~".to_vec());
+            }
+            other => panic!("expected a bracketed Write command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unbracketed_paste_sends_text_unwrapped_for_an_ssh_tab() {
+        let mut app = test_app();
+        let mut rx = wire_fake_worker(&mut app);
+        let session_id = SessionId::new();
+        push_ssh_tab(&mut app, Some(session_id));
+
+        paste_into_active_tab(&mut app, "hello");
+
+        match rx.try_recv() {
+            Ok(SshWorkerInput::Send(id, SessionCommand::Write(bytes))) => {
+                assert_eq!(id, session_id);
+                assert_eq!(bytes, b"hello".to_vec());
+            }
+            other => panic!("expected an unwrapped Write command, got {other:?}"),
+        }
     }
 }

@@ -105,16 +105,25 @@ impl GridHandler<'_> {
     }
 
     /// Handles CSI sequences with the `?` private-marker intermediate
-    /// (DEC private modes). Only `?1049h`/`?1049l` (alternate screen) matter
-    /// for M1.
+    /// (DEC private modes): `?1049h`/`?1049l` (alternate screen) and
+    /// `?2004h`/`?2004l` (bracketed paste).
     fn private_mode_dispatch(&mut self, params: &Params, action: char) {
         let values = flatten_params(params);
-        if values.first() == Some(&1049) {
-            match action {
-                'h' => self.grid.enter_alt_screen(),
-                'l' => self.grid.leave_alt_screen(),
-                _ => {}
+        let set = match action {
+            'h' => true,
+            'l' => false,
+            _ => return,
+        };
+        match values.first().copied() {
+            Some(1049) => {
+                if set {
+                    self.grid.enter_alt_screen();
+                } else {
+                    self.grid.leave_alt_screen();
+                }
             }
+            Some(2004) => self.grid.set_bracketed_paste(set),
+            _ => {}
         }
     }
 }
@@ -126,6 +135,7 @@ impl vte::Perform for GridHandler<'_> {
 
     fn execute(&mut self, byte: u8) {
         match byte {
+            0x07 => self.grid.ring_bell(),
             0x0a => self.grid.linefeed(),
             0x0d => self.grid.carriage_return(),
             0x08 => self.grid.backspace(),
@@ -177,5 +187,54 @@ impl vte::Perform for GridHandler<'_> {
                 self.grid.set_title(title);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn advance(grid: &mut TerminalGrid, bytes: &[u8]) {
+        let mut parser = vte::Parser::new();
+        let mut handler = GridHandler { grid };
+        for &byte in bytes {
+            parser.advance(&mut handler, byte);
+        }
+    }
+
+    #[test]
+    fn bel_byte_rings_the_bell() {
+        let mut grid = TerminalGrid::new(10, 20);
+        assert!(!grid.take_bell());
+
+        advance(&mut grid, b"\x07");
+
+        assert!(grid.take_bell());
+        assert!(!grid.take_bell(), "take_bell should clear the flag");
+    }
+
+    #[test]
+    fn csi_2004_toggles_bracketed_paste() {
+        let mut grid = TerminalGrid::new(10, 20);
+        assert!(!grid.bracketed_paste());
+
+        advance(&mut grid, b"\x1b[?2004h");
+        assert!(grid.bracketed_paste());
+
+        advance(&mut grid, b"\x1b[?2004l");
+        assert!(!grid.bracketed_paste());
+    }
+
+    #[test]
+    fn csi_1049_alt_screen_is_unaffected_by_the_2004_branch() {
+        let mut grid = TerminalGrid::new(10, 20);
+        advance(&mut grid, b"\x1b[?1049h");
+        advance(&mut grid, b"A");
+        let alt_row = grid.visible_rows()[0].clone();
+        assert!(alt_row.starts_with('A'));
+
+        advance(&mut grid, b"\x1b[?1049l");
+        let primary_row = grid.visible_rows()[0].clone();
+        assert!(!primary_row.starts_with('A'));
     }
 }
