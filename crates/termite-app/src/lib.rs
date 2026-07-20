@@ -11,7 +11,8 @@ use iced::futures::channel::mpsc as bridge;
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
-use iced::widget::{column, container, mouse_area, row, text, Stack};
+use iced::widget::text::{Rich, Span};
+use iced::widget::{column, container, mouse_area, row, Stack};
 use iced::{stream, Element, Font, Length, Subscription, Task, Theme};
 use secrecy::SecretString;
 
@@ -73,6 +74,11 @@ const MOUSE_WHEEL_DOWN: u8 = 65;
 /// Added to a button code to mark a motion report rather than a press.
 const MOUSE_MOTION_FLAG: u8 = 32;
 
+/// How close together (in time) two left-clicks on the same cell need to be
+/// to chain into a double/triple click, cycling `SelectionMode` through
+/// character → word → line (see `click_selection_mode`).
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 /// What a tab's byte source is. A local tab owns its own PTY end-to-end; an
@@ -107,6 +113,31 @@ impl TabKind {
     }
 }
 
+/// How much of a mouse-drag gesture on the terminal pane counts as
+/// "selected", cycled through by clicking the same cell repeatedly within
+/// `DOUBLE_CLICK_WINDOW` (see `click_selection_mode`) — the usual
+/// click/double-click/triple-click convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionMode {
+    Character,
+    Word,
+    Line,
+}
+
+/// A local text-selection gesture on a tab's terminal pane: purely a
+/// UI-input concern (like `bell_flash`), not something `TerminalGrid` needs
+/// to know about — it never leaves this process, unlike xterm mouse
+/// reporting's bytes. `anchor` is where the gesture started, `head` is where
+/// the mouse currently is (or was on release); either may come before the
+/// other in reading order, so rendering/copy always normalize via
+/// `selection_range`. Both are 0-indexed `(row, col)` grid coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+    mode: SelectionMode,
+}
+
 /// One open tab: its own terminal grid/parser plus whatever's feeding it.
 struct Tab {
     id: TabId,
@@ -120,6 +151,10 @@ struct Tab {
     /// `Tab` rather than `TerminalGrid`, which only records that a bell
     /// happened (`TerminalGrid::take_bell`).
     bell_flash: bool,
+    /// This tab's in-progress or most recently finished local text
+    /// selection, if any (see `Selection`). Cleared on a plain click with no
+    /// drag; anything else survives until the next click starts a new one.
+    selection: Option<Selection>,
 }
 
 impl Tab {
@@ -138,6 +173,7 @@ impl Tab {
             kind,
             status,
             bell_flash: false,
+            selection: None,
         }
     }
 
@@ -184,6 +220,11 @@ pub struct TermiteApp {
     /// needed to pick the right code for a motion report under
     /// `MouseTracking::ButtonEvent` (see `report_mouse_event`).
     mouse_button_down: Option<iced::mouse::Button>,
+    /// When and where (in grid cells) the most recent left-click landed,
+    /// used to detect a chained double/triple click for
+    /// `SelectionMode::Word`/`Line` (see `click_selection_mode`). `None`
+    /// once a click lands too late or on a different cell to chain.
+    last_click: Option<(std::time::Instant, (usize, usize), u8)>,
 
     // ── M4: host management ──────────────────────────────────────────
     host_store: Arc<dyn HostStore>,
@@ -248,6 +289,7 @@ impl TermiteApp {
             grid_size: (ROWS, COLS),
             mouse_position: None,
             mouse_button_down: None,
+            last_click: None,
             host_store: make_host_store(),
             hosts: Vec::new(),
             sidebar: SidebarState::default(),
@@ -667,17 +709,26 @@ fn update(app: &mut TermiteApp, message: Message) -> Task<Message> {
         Message::MouseMoved(point) => {
             app.mouse_position = Some(point);
             report_mouse_event(app, point, MouseReportKind::Motion);
+            if app.mouse_button_down == Some(iced::mouse::Button::Left) {
+                update_selection_head(app, point);
+            }
         }
         Message::MousePress(button) => {
             app.mouse_button_down = Some(button);
             if let Some(point) = app.mouse_position {
                 report_mouse_event(app, point, MouseReportKind::Press(button));
+                if button == iced::mouse::Button::Left {
+                    start_selection(app, point);
+                }
             }
         }
         Message::MouseRelease(button) => {
             app.mouse_button_down = None;
             if let Some(point) = app.mouse_position {
                 report_mouse_event(app, point, MouseReportKind::Release(button));
+            }
+            if button == iced::mouse::Button::Left {
+                return finish_selection(app);
             }
         }
         Message::MouseScrolled(delta) => {
@@ -921,6 +972,265 @@ fn report_mouse_event(app: &mut TermiteApp, point: iced::Point, kind: MouseRepor
     };
     if let Some(id) = ssh_target {
         send_to_session(app, id, SessionCommand::Write(bytes));
+    }
+}
+
+// ── Text selection ───────────────────────────────────────────────────────────
+
+/// Converts a pane-local pixel position into a 0-indexed `(row, col)` grid
+/// cell, clamped to the grid's current bounds. Selection tracks cells
+/// 0-indexed (matching `TerminalGrid`/`visible_rows` indexing) rather than
+/// the 1-indexed form `cell_at` returns for xterm reports, so this just
+/// reuses `cell_at`'s pixel math and shifts it down by one.
+fn cell_at_zero_indexed(point: iced::Point, rows: usize, cols: usize) -> (usize, usize) {
+    let (col, row) = cell_at(point, rows, cols);
+    (row - 1, col - 1)
+}
+
+/// Determines the `SelectionMode` a left-click at `cell` should start,
+/// cycling character → word → line on repeated clicks landing on the same
+/// cell within `DOUBLE_CLICK_WINDOW` — the usual
+/// click/double-click/triple-click convention — and updates
+/// `TermiteApp::last_click` to chain a further click after this one.
+fn click_selection_mode(app: &mut TermiteApp, cell: (usize, usize)) -> SelectionMode {
+    let now = std::time::Instant::now();
+    let count = match app.last_click {
+        Some((at, at_cell, count))
+            if at_cell == cell && now.duration_since(at) < DOUBLE_CLICK_WINDOW =>
+        {
+            (count % 3) + 1
+        }
+        _ => 1,
+    };
+    app.last_click = Some((now, cell, count));
+    match count {
+        1 => SelectionMode::Character,
+        2 => SelectionMode::Word,
+        _ => SelectionMode::Line,
+    }
+}
+
+/// Starts a local text-selection gesture at `point` on a left-button press.
+/// A no-op — and clears any existing selection — when the active tab's grid
+/// currently has xterm mouse tracking enabled, since that app already owns
+/// click/drag (see `report_mouse_event`); there's no modifier-key override
+/// yet, as `mouse_area`'s callbacks don't surface `Modifiers` to check for
+/// one (same gap noted on `report_mouse_event`).
+fn start_selection(app: &mut TermiteApp, point: iced::Point) {
+    let Some((rows, cols, tracking)) = app
+        .active_tab()
+        .map(|tab| (tab.grid.rows(), tab.grid.cols(), tab.grid.mouse_tracking()))
+    else {
+        return;
+    };
+    let cell = cell_at_zero_indexed(point, rows, cols);
+    if tracking != MouseTracking::Off {
+        if let Some(tab) = app.active_tab_mut() {
+            tab.selection = None;
+        }
+        return;
+    }
+    let mode = click_selection_mode(app, cell);
+    if let Some(tab) = app.active_tab_mut() {
+        tab.selection = Some(Selection {
+            anchor: cell,
+            head: cell,
+            mode,
+        });
+    }
+}
+
+/// Extends the active tab's in-progress selection to `point`, while the left
+/// button is held (see `Message::MouseMoved`). A no-op if there's no
+/// in-progress selection (e.g. mouse tracking claimed the gesture instead).
+fn update_selection_head(app: &mut TermiteApp, point: iced::Point) {
+    let Some(tab) = app.active_tab_mut() else {
+        return;
+    };
+    let (rows, cols) = (tab.grid.rows(), tab.grid.cols());
+    let cell = cell_at_zero_indexed(point, rows, cols);
+    if let Some(selection) = tab.selection.as_mut() {
+        selection.head = cell;
+    }
+}
+
+/// Finalizes a left-button release. A plain click with no drag in
+/// `SelectionMode::Character` (anchor never moved) selects nothing useful,
+/// so it's dropped rather than left showing a zero-width highlight; a
+/// double/triple click's word/line selection is kept even without a drag,
+/// since it's already meaningful on its own. Whatever's left standing is
+/// copied to the system clipboard — matching common terminal "select to
+/// copy" behavior — via a returned `Task`; `Task::none()` if there's nothing
+/// to copy.
+fn finish_selection(app: &mut TermiteApp) -> Task<Message> {
+    let Some(tab) = app.active_tab_mut() else {
+        return Task::none();
+    };
+    let Some(selection) = tab.selection else {
+        return Task::none();
+    };
+    if selection.mode == SelectionMode::Character && selection.anchor == selection.head {
+        tab.selection = None;
+        return Task::none();
+    }
+
+    let rows = grid_char_rows(&tab.grid);
+    let text = selection_text(&rows, &selection);
+    if text.is_empty() {
+        return Task::none();
+    }
+    iced::clipboard::write(text)
+}
+
+/// Splits a grid's visible rows into per-character `Vec<char>`s, the shape
+/// `selection_range`/`selection_text`/`terminal_spans` all work in — avoids
+/// byte-index slicing on `String`, which would panic on any non-ASCII cell.
+fn grid_char_rows(grid: &TerminalGrid) -> Vec<Vec<char>> {
+    grid.visible_rows()
+        .iter()
+        .map(|row| row.chars().collect())
+        .collect()
+}
+
+/// Expands `col` on `row` to the start/end of the run of same-"wordness"
+/// characters it sits in (`is_alphanumeric` or `_` vs. everything else,
+/// including whitespace and punctuation, which are their own run) — the
+/// usual double-click word-selection rule.
+fn word_bounds(row: &[char], col: usize) -> (usize, usize) {
+    if row.is_empty() {
+        return (0, 0);
+    }
+    let col = col.min(row.len() - 1);
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let class = is_word(row[col]);
+    let mut start = col;
+    while start > 0 && is_word(row[start - 1]) == class {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < row.len() && is_word(row[end + 1]) == class {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Normalizes a `Selection`'s `anchor`/`head` (which may point in either
+/// reading-order direction) into an inclusive `(start, end)` `(row, col)`
+/// range, expanded per `SelectionMode`: `Character` uses the raw range,
+/// `Word` expands both ends to their word boundaries (`word_bounds`), `Line`
+/// expands to the full width of every covered row. Used for both rendering
+/// the highlight (`terminal_spans`) and extracting the copied text
+/// (`selection_text`).
+fn selection_range(rows: &[Vec<char>], selection: &Selection) -> ((usize, usize), (usize, usize)) {
+    let (mut start, mut end) = if selection.anchor <= selection.head {
+        (selection.anchor, selection.head)
+    } else {
+        (selection.head, selection.anchor)
+    };
+    match selection.mode {
+        SelectionMode::Character => {}
+        SelectionMode::Word => {
+            if let Some(row) = rows.get(start.0) {
+                start.1 = word_bounds(row, start.1).0;
+            }
+            if let Some(row) = rows.get(end.0) {
+                end.1 = word_bounds(row, end.1).1;
+            }
+        }
+        SelectionMode::Line => {
+            start.1 = 0;
+            end.1 = rows.get(end.0).map_or(0, |row| row.len().saturating_sub(1));
+        }
+    }
+    (start, end)
+}
+
+/// Extracts the plain text covered by `selection`, one grid row per line,
+/// each row's trailing padding (grid rows are always padded to the full
+/// column width with spaces) trimmed so a copy doesn't end every line with a
+/// wall of whitespace.
+fn selection_text(rows: &[Vec<char>], selection: &Selection) -> String {
+    let (start, end) = selection_range(rows, selection);
+    let mut lines = Vec::with_capacity(end.0 - start.0 + 1);
+    for r in start.0..=end.0 {
+        let row = rows.get(r).map_or(&[][..], Vec::as_slice);
+        let lo = if r == start.0 {
+            start.1.min(row.len())
+        } else {
+            0
+        };
+        let hi = if r == end.0 {
+            (end.1 + 1).min(row.len())
+        } else {
+            row.len()
+        };
+        lines.push(
+            row[lo..hi]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
+/// Builds the `rich_text` spans for a tab's terminal pane: the row text as
+/// plain spans, with whatever `selection` covers pulled out into its own
+/// span carrying a `SELECTION`-coloured background. Rows are always full
+/// grid width (padded with spaces), so column indices from
+/// `selection_range` never need clamping against a shorter row.
+fn terminal_spans(
+    rows: &[Vec<char>],
+    selection: Option<&Selection>,
+) -> Vec<Span<'static, Message>> {
+    let range = selection.map(|selection| selection_range(rows, selection));
+
+    let mut spans = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        if r > 0 {
+            spans.push(Span::new("\n".to_string()));
+        }
+        let covers_this_row = range.filter(|(start, end)| r >= start.0 && r <= end.0);
+        match covers_this_row {
+            Some((start, end)) => {
+                let sel_start = if r == start.0 { start.1 } else { 0 };
+                let sel_end = if r == end.0 {
+                    end.1
+                } else {
+                    row.len().saturating_sub(1)
+                };
+                push_row_with_selection(&mut spans, row, sel_start, sel_end);
+            }
+            None => spans.push(Span::new(row.iter().collect::<String>())),
+        }
+    }
+    spans
+}
+
+/// Pushes up to three spans for one row: the unselected prefix (if any), the
+/// selected run with a `SELECTION` background, and the unselected suffix (if
+/// any). `sel_start`/`sel_end` are inclusive and clamped to the row.
+fn push_row_with_selection(
+    spans: &mut Vec<Span<'static, Message>>,
+    row: &[char],
+    sel_start: usize,
+    sel_end: usize,
+) {
+    if row.is_empty() {
+        return;
+    }
+    let sel_start = sel_start.min(row.len() - 1);
+    let sel_end = sel_end.min(row.len() - 1);
+    if sel_start > 0 {
+        spans.push(Span::new(row[..sel_start].iter().collect::<String>()));
+    }
+    spans.push(
+        Span::new(row[sel_start..=sel_end].iter().collect::<String>())
+            .background(termite_ui::theme::colours::SELECTION),
+    );
+    if sel_end + 1 < row.len() {
+        spans.push(Span::new(row[sel_end + 1..].iter().collect::<String>()));
     }
 }
 
@@ -1847,15 +2157,17 @@ fn view(app: &TermiteApp) -> Element<'_, Message> {
     let summaries = tab_summaries(app);
     let tab_bar = tabbar::view(&summaries, app.active_tab).map(Message::TabBar);
 
-    let rows = app
+    let (rows, selection) = app
         .active_tab()
-        .map(|tab| tab.grid.visible_rows().join("\n"))
+        .map(|tab| (grid_char_rows(&tab.grid), tab.selection))
         .unwrap_or_default();
     let bell_flash = app.active_tab().is_some_and(|tab| tab.bell_flash);
-    let terminal = text(rows)
+    let spans = terminal_spans(&rows, selection.as_ref());
+    let terminal: Element<'_, Message> = Rich::with_spans(spans)
         .font(Font::MONOSPACE)
         .size(14)
-        .width(Length::Fill);
+        .width(Length::Fill)
+        .into();
     let terminal = container(terminal).style(move |_theme| {
         if bell_flash {
             container::Style {
@@ -3480,5 +3792,226 @@ mod tests {
             }
             other => panic!("expected a wheel-down report, got {other:?}"),
         }
+    }
+
+    // ── M6: selection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn word_bounds_expands_to_the_run_of_word_or_non_word_chars() {
+        let row: Vec<char> = "foo  bar-baz".chars().collect();
+        assert_eq!(word_bounds(&row, 1), (0, 2), "inside `foo`");
+        assert_eq!(word_bounds(&row, 3), (3, 4), "the run of spaces");
+        assert_eq!(word_bounds(&row, 6), (5, 7), "inside `bar`");
+        assert_eq!(word_bounds(&row, 8), (8, 8), "a lone punctuation run");
+    }
+
+    #[test]
+    fn selection_range_character_mode_normalizes_drag_direction() {
+        let rows = vec!["abcdef".chars().collect::<Vec<char>>()];
+        let forward = Selection {
+            anchor: (0, 1),
+            head: (0, 4),
+            mode: SelectionMode::Character,
+        };
+        let backward = Selection {
+            anchor: (0, 4),
+            head: (0, 1),
+            mode: SelectionMode::Character,
+        };
+        assert_eq!(selection_range(&rows, &forward), ((0, 1), (0, 4)));
+        assert_eq!(selection_range(&rows, &backward), ((0, 1), (0, 4)));
+    }
+
+    #[test]
+    fn selection_range_word_mode_expands_both_ends_to_word_boundaries() {
+        let rows = vec!["foo bar baz".chars().collect::<Vec<char>>()];
+        let selection = Selection {
+            anchor: (0, 1), // inside "foo"
+            head: (0, 9),   // inside "baz"
+            mode: SelectionMode::Word,
+        };
+        assert_eq!(selection_range(&rows, &selection), ((0, 0), (0, 10)));
+    }
+
+    #[test]
+    fn selection_range_line_mode_covers_the_full_row_width() {
+        let rows = vec!["ab".chars().collect::<Vec<char>>(), "cd".chars().collect()];
+        let selection = Selection {
+            anchor: (0, 1),
+            head: (1, 0),
+            mode: SelectionMode::Line,
+        };
+        assert_eq!(selection_range(&rows, &selection), ((0, 0), (1, 1)));
+    }
+
+    #[test]
+    fn selection_text_trims_padding_and_joins_multiple_rows() {
+        let rows = vec![
+            "hello   ".chars().collect::<Vec<char>>(),
+            "world   ".chars().collect(),
+        ];
+        let selection = Selection {
+            anchor: (0, 0),
+            head: (1, 4),
+            mode: SelectionMode::Character,
+        };
+        assert_eq!(selection_text(&rows, &selection), "hello\nworld");
+    }
+
+    #[test]
+    fn click_selection_mode_cycles_character_word_line_on_the_same_cell() {
+        let mut app = test_app();
+        let cell = (2, 3);
+        assert_eq!(
+            click_selection_mode(&mut app, cell),
+            SelectionMode::Character
+        );
+        assert_eq!(click_selection_mode(&mut app, cell), SelectionMode::Word);
+        assert_eq!(click_selection_mode(&mut app, cell), SelectionMode::Line);
+        assert_eq!(
+            click_selection_mode(&mut app, cell),
+            SelectionMode::Character,
+            "a fourth click cycles back to character"
+        );
+    }
+
+    #[test]
+    fn click_selection_mode_resets_on_a_different_cell() {
+        let mut app = test_app();
+        assert_eq!(
+            click_selection_mode(&mut app, (0, 0)),
+            SelectionMode::Character
+        );
+        assert_eq!(
+            click_selection_mode(&mut app, (1, 1)),
+            SelectionMode::Character,
+            "a click on a different cell doesn't chain"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_starts_and_extends_a_character_selection() {
+        let mut app = test_app();
+        let start = iced::Point::new(0.0, 0.0);
+        let end = iced::Point::new(CELL_WIDTH_PX * 3.5, CELL_HEIGHT_PX * 1.5);
+
+        let _ = update(&mut app, Message::MouseMoved(start));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+        let _ = update(&mut app, Message::MouseMoved(end));
+
+        let selection = app.active_tab().unwrap().selection.unwrap();
+        assert_eq!(selection.mode, SelectionMode::Character);
+        assert_eq!(selection.anchor, (0, 0));
+        assert_eq!(selection.head, (1, 3));
+    }
+
+    #[test]
+    fn releasing_a_plain_click_with_no_drag_clears_the_selection() {
+        let mut app = test_app();
+        let point = iced::Point::new(0.0, 0.0);
+
+        let _ = update(&mut app, Message::MouseMoved(point));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+        let _ = update(&mut app, Message::MouseRelease(iced::mouse::Button::Left));
+
+        assert!(app.active_tab().unwrap().selection.is_none());
+    }
+
+    #[test]
+    fn releasing_after_a_drag_keeps_the_selection() {
+        let mut app = test_app();
+        let start = iced::Point::new(0.0, 0.0);
+        let end = iced::Point::new(CELL_WIDTH_PX * 3.5, 0.0);
+
+        let _ = update(&mut app, Message::MouseMoved(start));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+        let _ = update(&mut app, Message::MouseMoved(end));
+        let _ = update(&mut app, Message::MouseRelease(iced::mouse::Button::Left));
+
+        assert!(app.active_tab().unwrap().selection.is_some());
+    }
+
+    #[test]
+    fn a_double_click_selects_word_mode_even_without_a_drag() {
+        let mut app = test_app();
+        let point = iced::Point::new(0.0, 0.0);
+
+        let _ = update(&mut app, Message::MouseMoved(point));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+        let _ = update(&mut app, Message::MouseRelease(iced::mouse::Button::Left));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+
+        let selection = app.active_tab().unwrap().selection.unwrap();
+        assert_eq!(selection.mode, SelectionMode::Word);
+
+        let _ = update(&mut app, Message::MouseRelease(iced::mouse::Button::Left));
+        assert!(
+            app.active_tab().unwrap().selection.is_some(),
+            "a word-mode selection survives release even with anchor == head"
+        );
+    }
+
+    #[test]
+    fn selection_is_not_started_while_mouse_tracking_is_enabled() {
+        let mut app = test_app();
+        app.active_tab_mut()
+            .unwrap()
+            .grid
+            .set_mouse_tracking(MouseTracking::Normal);
+        let point = iced::Point::new(0.0, 0.0);
+
+        let _ = update(&mut app, Message::MouseMoved(point));
+        let _ = update(&mut app, Message::MousePress(iced::mouse::Button::Left));
+
+        assert!(app.active_tab().unwrap().selection.is_none());
+    }
+
+    #[test]
+    fn terminal_spans_with_no_selection_is_one_plain_span_per_row() {
+        let rows = vec!["ab".chars().collect::<Vec<char>>(), "cd".chars().collect()];
+
+        let spans = terminal_spans(&rows, None);
+
+        assert_eq!(spans.len(), 3, "two rows plus one newline separator");
+        assert_eq!(spans[0].text.as_ref(), "ab");
+        assert!(spans[0].highlight.is_none());
+        assert_eq!(spans[1].text.as_ref(), "\n");
+        assert_eq!(spans[2].text.as_ref(), "cd");
+    }
+
+    #[test]
+    fn terminal_spans_splits_a_partially_selected_row_into_three_spans() {
+        let rows = vec!["abcd".chars().collect::<Vec<char>>()];
+        let selection = Selection {
+            anchor: (0, 1),
+            head: (0, 2),
+            mode: SelectionMode::Character,
+        };
+
+        let spans = terminal_spans(&rows, Some(&selection));
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text.as_ref(), "a");
+        assert!(spans[0].highlight.is_none());
+        assert_eq!(spans[1].text.as_ref(), "bc");
+        assert!(spans[1].highlight.is_some());
+        assert_eq!(spans[2].text.as_ref(), "d");
+        assert!(spans[2].highlight.is_none());
+    }
+
+    #[test]
+    fn terminal_spans_for_a_fully_selected_row_is_a_single_highlighted_span() {
+        let rows = vec!["abcd".chars().collect::<Vec<char>>()];
+        let selection = Selection {
+            anchor: (0, 0),
+            head: (0, 3),
+            mode: SelectionMode::Line,
+        };
+
+        let spans = terminal_spans(&rows, Some(&selection));
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text.as_ref(), "abcd");
+        assert!(spans[0].highlight.is_some());
     }
 }

@@ -50,4 +50,8 @@ pub mod colours {
 
     /// Success — connected indicator.
     pub const SUCCESS: Color = Color::from_rgb(0.259, 0.792, 0.490); // #42CA7D
+
+    /// Local text-selection highlight — semi-transparent accent, used as a
+    /// terminal text span's background while the mouse has a selection.
+    pub const SELECTION: Color = Color::from_rgba(0.251, 0.557, 0.996, 0.35);
 }
